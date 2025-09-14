@@ -1,0 +1,26 @@
+{
+  "dockerComposeFile": [
+    "../docker-compose.yml"
+  ],
+  "service": "app",
+  "workspaceFolder": "/workspace/creating-programming-languages-in-rust",
+  "postCreateCommand": "rustup component add rust-analyzer rustfmt",
+  "postAttachCommand": "git config --global --add safe.directory /workspace/creating-programming-languages-in-rust",
+  "containerEnv": {
+    "SHELL": "/bin/bash"
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "git.openRepositoryInParentFolders": "always",
+        "rust-analyzer.server.path": "/usr/local/cargo/bin/rust-analyzer",
+        "editor.formatOnSave": true,
+        "rust-analyzer.rustfmt.enableRangeFormatting": true
+      },
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "shardulm94.trailing-spaces"
+      ]
+    }
+  }
+}

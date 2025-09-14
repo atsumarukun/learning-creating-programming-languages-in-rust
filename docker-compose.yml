@@ -1,0 +1,7 @@
+services:
+  app:
+    image: rust:1.89
+    volumes:
+      - .:/workspace/creating-programming-languages-in-rust
+    working_dir: /workspace/creating-programming-languages-in-rust
+    tty: true
