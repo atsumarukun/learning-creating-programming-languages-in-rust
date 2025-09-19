@@ -9,7 +9,7 @@ use nom::{
     error::ParseError,
     multi::{fold_many0, many0, separated_list0},
     number::complete::recognize_float,
-    sequence::{delimited, pair},
+    sequence::{delimited, pair, preceded},
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -21,6 +21,11 @@ enum Expression<'src> {
     Sub(Box<Expression<'src>>, Box<Expression<'src>>),
     Mul(Box<Expression<'src>>, Box<Expression<'src>>),
     Div(Box<Expression<'src>>, Box<Expression<'src>>),
+    If(
+        Box<Expression<'src>>,
+        Box<Expression<'src>>,
+        Option<Box<Expression<'src>>>,
+    ),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -39,6 +44,16 @@ where
     E: ParseError<&'src str>,
 {
     delimited(multispace0, f, multispace0)
+}
+
+fn open_brace(input: &str) -> IResult<&str, ()> {
+    let (input, _) = space_delimited(char('{')).parse(input)?;
+    Ok((input, ()))
+}
+
+fn close_brace(input: &str) -> IResult<&str, ()> {
+    let (input, _) = space_delimited(char('}')).parse(input)?;
+    Ok((input, ()))
 }
 
 fn number(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
@@ -101,7 +116,7 @@ fn term(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
     .parse(input)
 }
 
-fn expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
+fn num_expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
     let (input, init) = term(input)?;
 
     fold_many0(
@@ -114,6 +129,26 @@ fn expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
         },
     )
     .parse(input)
+}
+
+fn if_expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
+    let (input, _) = space_delimited(tag("if")).parse(input)?;
+    let (input, cond) = expr(input)?;
+    let (input, t_case) = delimited(open_brace, expr, close_brace).parse(input)?;
+    let (input, f_case) = opt(preceded(
+        space_delimited(tag("else")),
+        delimited(open_brace, expr, close_brace),
+    ))
+    .parse(input)?;
+
+    Ok((
+        input,
+        Expression::If(Box::new(cond), Box::new(t_case), f_case.map(Box::new)),
+    ))
+}
+
+fn expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
+    alt((if_expr, num_expr)).parse(input)
 }
 
 fn var_def(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
@@ -194,6 +229,15 @@ fn eval(expr: Expression, vars: &HashMap<&str, f64>) -> f64 {
         Sub(lhs, rhs) => eval(*lhs, vars) - eval(*rhs, vars),
         Mul(lhs, rhs) => eval(*lhs, vars) * eval(*rhs, vars),
         Div(lhs, rhs) => eval(*lhs, vars) / eval(*rhs, vars),
+        If(cond, t_case, f_case) => {
+            if eval(*cond, vars) != 0. {
+                eval(*t_case, vars)
+            } else if let Some(f_case) = f_case {
+                eval(*f_case, vars)
+            } else {
+                0.
+            }
+        }
     }
 }
 
