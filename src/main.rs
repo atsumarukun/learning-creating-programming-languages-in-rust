@@ -1,147 +1,74 @@
-#[derive(Debug, PartialEq)]
-enum Expression<'src> {
+use nom::{
+    IResult, Parser,
+    branch::alt,
+    bytes::complete::tag,
+    character::complete::{alpha1, alphanumeric1, char, multispace0},
+    combinator::recognize,
+    multi::{fold_many0, many0},
+    number::complete::recognize_float,
+    sequence::{delimited, pair},
+};
+
+#[derive(Debug, PartialEq, Clone)]
+enum Token<'src> {
     Ident(&'src str),
-    NumLiteral(f64),
+    Number(f64),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum Expression<'src> {
+    Value(Token<'src>),
     Add(Box<Expression<'src>>, Box<Expression<'src>>),
 }
 
-fn advance_char(input: &str) -> &str {
-    let mut chars = input.chars();
-    chars.next();
-    chars.as_str()
+fn number(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
+    let (r, v) = delimited(multispace0, recognize_float, multispace0).parse(input)?;
+    Ok((
+        r,
+        Expression::Value(Token::Number(v.parse().map_err(|_| {
+            nom::Err::Error(nom::error::Error {
+                input,
+                code: nom::error::ErrorKind::Digit,
+            })
+        })?)),
+    ))
 }
 
-fn peek_char(input: &str) -> Option<char> {
-    input.chars().next()
+fn identifier(input: &str) -> IResult<&str, &str> {
+    recognize(pair(
+        alt((alpha1, tag("_"))),
+        many0(alt((alphanumeric1, tag("_")))),
+    ))
+    .parse(input)
 }
 
-fn whitespace(mut input: &str) -> &str {
-    while matches!(peek_char(input), Some(' ')) {
-        input = advance_char(input);
-    }
-    input
+fn ident(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
+    let (r, res) = delimited(multispace0, identifier, multispace0).parse(input)?;
+    Ok((r, Expression::Value(Token::Ident(res))))
 }
 
-fn number(mut input: &'_ str) -> Option<(&'_ str, Expression<'_>)> {
-    let start = input;
-    if matches!(peek_char(input), Some('-' | '+' | '.' | '0'..='9')) {
-        input = advance_char(input);
-        while matches!(peek_char(input), Some('.' | '0'..='9')) {
-            input = advance_char(input);
-        }
-        if let Ok(num) = start[..(start.len() - input.len())].parse::<f64>() {
-            return Some((input, Expression::NumLiteral(num)));
-        }
-        return None;
-    }
-    None
+fn parens(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
+    delimited(
+        multispace0,
+        delimited(tag("("), expr, tag(")")),
+        multispace0,
+    )
+    .parse(input)
 }
 
-fn ident(mut input: &'_ str) -> Option<(&'_ str, Expression<'_>)> {
-    let start = input;
-    if matches!(peek_char(input), Some('a'..='z' | 'A'..='Z')) {
-        input = advance_char(input);
-        while matches!(peek_char(input), Some('a'..='z' | 'A'..='Z' | '0'..='9')) {
-            input = advance_char(input);
-        }
-        return Some((
-            input,
-            Expression::Ident(&start[..(start.len() - input.len())]),
-        ));
-    }
-    None
+fn term(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
+    alt((number, ident, parens)).parse(input)
 }
 
-fn lparen(input: &str) -> Option<&str> {
-    if matches!(peek_char(input), Some('(')) {
-        return Some(advance_char(input));
-    }
-    None
-}
+fn expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
+    let (input, init) = term(input)?;
 
-fn rparen(input: &str) -> Option<&str> {
-    if matches!(peek_char(input), Some(')')) {
-        return Some(advance_char(input));
-    }
-    None
-}
-
-fn plus(input: &str) -> Option<&str> {
-    if matches!(peek_char(input), Some('+')) {
-        return Some(advance_char(input));
-    }
-    None
-}
-
-fn token(i: &'_ str) -> Option<(&'_ str, Expression<'_>)> {
-    if let Some(res) = ident(whitespace(i)) {
-        return Some(res);
-    }
-
-    if let Some(res) = number(whitespace(i)) {
-        return Some(res);
-    }
-
-    None
-}
-
-fn paren(input: &'_ str) -> Option<(&'_ str, Expression<'_>)> {
-    let next_input = lparen(whitespace(input))?;
-
-    let (next_input, expr) = expr(next_input)?;
-
-    let next_input = rparen(whitespace(next_input))?;
-
-    Some((next_input, expr))
-}
-
-fn term(input: &'_ str) -> Option<(&'_ str, Expression<'_>)> {
-    if let Some(res) = paren(input) {
-        return Some(res);
-    }
-
-    if let Some(res) = token(input) {
-        return Some(res);
-    }
-
-    None
-}
-
-fn add_term(input: &'_ str) -> Option<(&'_ str, Expression<'_>)> {
-    let (next_input, lhs) = term(input)?;
-
-    let next_input = plus(whitespace(next_input))?;
-
-    Some((next_input, lhs))
-}
-
-fn add(mut input: &'_ str) -> Option<(&'_ str, Expression<'_>)> {
-    let mut left = None;
-    while let Some((next_input, expr)) = add_term(input) {
-        if let Some(prev_left) = left {
-            left = Some(Expression::Add(Box::new(prev_left), Box::new(expr)));
-        } else {
-            left = Some(expr);
-        }
-        input = next_input;
-    }
-    let left = left?;
-
-    let (next_input, rhs) = expr(input)?;
-
-    Some((next_input, Expression::Add(Box::new(left), Box::new(rhs))))
-}
-
-fn expr(input: &'_ str) -> Option<(&'_ str, Expression<'_>)> {
-    if let Some(res) = add(input) {
-        return Some(res);
-    }
-
-    if let Some(res) = term(input) {
-        return Some(res);
-    }
-
-    None
+    fold_many0(
+        pair(delimited(multispace0, char('+'), multispace0), term),
+        move || init.clone(),
+        |acc, (_op, val): (char, Expression)| Expression::Add(Box::new(acc), Box::new(val)),
+    )
+    .parse(input)
 }
 
 fn main() {
@@ -159,27 +86,7 @@ fn main() {
 
     let input = "((1 + 2) + (3 + 4)) + 5 + 6";
     println!("source: {:?}, parsed: {:?}", input, expr(input));
-}
 
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_whitespace() {
-        assert_eq!(whitespace("    "), "");
-    }
-
-    #[test]
-    fn test_number() {
-        assert_eq!(
-            number("-123.45"),
-            Some((" ", Expression::NumLiteral(-123.45)))
-        );
-    }
-
-    #[test]
-    fn test_ident() {
-        assert_eq!(ident("Adam"), Some(("", Expression::Ident("Adam"))));
-    }
+    let res: IResult<&str, &str> = alt((tag("abc"), tag("def"), tag("ghi"))).parse("ghiabcdefj");
+    println!("{res:?}");
 }
