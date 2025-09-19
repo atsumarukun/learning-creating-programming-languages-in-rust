@@ -1,92 +1,116 @@
-use nom::{
-    IResult, Parser,
-    branch::alt,
-    bytes::complete::tag,
-    character::complete::{alpha1, alphanumeric1, char, multispace0},
-    combinator::recognize,
-    multi::{fold_many0, many0},
-    number::complete::recognize_float,
-    sequence::{delimited, pair},
+#[macro_use]
+extern crate pest_derive;
+
+use ::pest::{
+    Parser,
+    iterators::{Pair, Pairs},
 };
 
-#[derive(Debug, PartialEq, Clone)]
-enum Token<'src> {
-    Ident(&'src str),
-    Number(f64),
-}
+#[derive(Parser)]
+#[grammar = "../assets/expr.pest"]
+struct ExprParser;
 
 #[derive(Debug, PartialEq, Clone)]
-enum Expression<'src> {
-    Value(Token<'src>),
-    Add(Box<Expression<'src>>, Box<Expression<'src>>),
+pub enum Expression {
+    NumLiteral(f64),
+    Ident(String),
+    FnInvoke(String, Vec<Expression>),
+    Add(Box<Expression>, Box<Expression>),
+    Sub(Box<Expression>, Box<Expression>),
+    Mult(Box<Expression>, Box<Expression>),
+    Div(Box<Expression>, Box<Expression>),
 }
 
-fn number(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
-    let (r, v) = delimited(multispace0, recognize_float, multispace0).parse(input)?;
-    Ok((
-        r,
-        Expression::Value(Token::Number(v.parse().map_err(|_| {
-            nom::Err::Error(nom::error::Error {
-                input,
-                code: nom::error::ErrorKind::Digit,
-            })
-        })?)),
-    ))
+fn parse_value(value: Pair<Rule>) -> Expression {
+    match value.as_rule() {
+        Rule::number => Expression::NumLiteral(value.as_str().parse().unwrap()),
+        Rule::ident => Expression::Ident(value.as_str().to_owned()),
+        _ => unreachable!(),
+    }
 }
 
-fn identifier(input: &str) -> IResult<&str, &str> {
-    recognize(pair(
-        alt((alpha1, tag("_"))),
-        many0(alt((alphanumeric1, tag("_")))),
-    ))
-    .parse(input)
+fn parse_product(terms: Pairs<Rule>) -> Expression {
+    let mut product = None;
+    let mut last_op = None;
+    for value in terms {
+        match value.as_rule() {
+            Rule::sum => {
+                product = Some(parse_sum(value));
+            }
+            Rule::value => {
+                let value = parse_value(value.into_inner().next().unwrap());
+                if let Some((last_product, last_op)) = product.zip(last_op) {
+                    if let Rule::times = last_op {
+                        product = Some(Expression::Mult(Box::new(last_product), Box::new(value)));
+                    } else {
+                        product = Some(Expression::Div(Box::new(last_product), Box::new(value)));
+                    }
+                } else {
+                    product = Some(value);
+                }
+            }
+            Rule::times | Rule::divides => last_op = Some(value.as_rule()),
+            _ => (),
+        }
+    }
+    product.unwrap()
 }
 
-fn ident(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
-    let (r, res) = delimited(multispace0, identifier, multispace0).parse(input)?;
-    Ok((r, Expression::Value(Token::Ident(res))))
+fn parse_sum(sum: Pair<Rule>) -> Expression {
+    let mut ret = None;
+    let mut last_op = Rule::add;
+    for sub_expr in sum.into_inner() {
+        match sub_expr.as_rule() {
+            Rule::product => {
+                let value = parse_product(sub_expr.into_inner());
+                if let Some(last_sum) = ret {
+                    if let Rule::add = last_op {
+                        ret = Some(Expression::Add(Box::new(last_sum), Box::new(value)));
+                    } else {
+                        ret = Some(Expression::Sub(Box::new(last_sum), Box::new(value)));
+                    }
+                } else {
+                    ret = Some(value);
+                }
+            }
+            Rule::add | Rule::subtract => last_op = sub_expr.as_rule(),
+            _ => unreachable!(),
+        }
+    }
+    ret.unwrap()
 }
 
-fn parens(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
-    delimited(
-        multispace0,
-        delimited(tag("("), expr, tag(")")),
-        multispace0,
-    )
-    .parse(input)
-}
+fn parse_string(input: &str) -> Option<Expression> {
+    let parsed = ExprParser::parse(Rule::file, &input)
+        .expect("unsuccessful parse")
+        .next()
+        .unwrap();
 
-fn term(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
-    alt((number, ident, parens)).parse(input)
-}
-
-fn expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
-    let (input, init) = term(input)?;
-
-    fold_many0(
-        pair(delimited(multispace0, char('+'), multispace0), term),
-        move || init.clone(),
-        |acc, (_op, val): (char, Expression)| Expression::Add(Box::new(acc), Box::new(val)),
-    )
-    .parse(input)
+    let inner = parsed.into_inner().next().unwrap();
+    assert!(matches!(inner.as_rule(), Rule::sum));
+    Some(parse_sum(inner))
 }
 
 fn main() {
-    let input = "123";
-    println!("source: {:?}, parsed: {:?}", input, expr(input));
+    let parsed = ExprParser::parse(Rule::AB, &"abc")
+        .expect("unsuccessful parse")
+        .next()
+        .unwrap();
+
+    assert!(matches!(parsed.as_rule(), Rule::AB));
+
+    let input = "23 * 34";
+    println!("source: {input:?}, parsed: {:#?}", parse_string(input));
 
     let input = "Hello + world";
-    println!("source: {:?}, parsed: {:?}", input, expr(input));
+    println!("source: {input:?}, parsed: {:#?}", parse_string(input));
 
     let input = "(123 + 456 ) + world";
-    println!("source: {:?}, parsed: {:?}", input, expr(input));
+    println!("source: {input:?}, parsed: {:#?}", parse_string(input));
 
     let input = "car + cdr + cdr";
-    println!("source: {:?}, parsed: {:?}", input, expr(input));
+    println!("source: {input:?}, parsed: {:#?}", parse_string(input));
 
     let input = "((1 + 2) + (3 + 4)) + 5 + 6";
-    println!("source: {:?}, parsed: {:?}", input, expr(input));
-
-    let res: IResult<&str, &str> = alt((tag("abc"), tag("def"), tag("ghi"))).parse("ghiabcdefj");
-    println!("{res:?}");
+    println!("source: {input:?}, parsed: {:#?}", parse_string(input));
 }
