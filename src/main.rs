@@ -27,6 +27,7 @@ enum Expression<'src> {
 enum Statement<'src> {
     Expression(Expression<'src>),
     VarDef(&'src str, Expression<'src>),
+    VarAssign(&'src str, Expression<'src>),
 }
 
 type Statements<'a> = Vec<Statement<'a>>;
@@ -123,13 +124,20 @@ fn var_def(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
     Ok((input, Statement::VarDef(name, expr)))
 }
 
+fn var_assign(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
+    let (input, name) = space_delimited(identifier).parse(input)?;
+    let (input, _) = space_delimited(char('=')).parse(input)?;
+    let (input, expr) = space_delimited(expr).parse(input)?;
+    Ok((input, Statement::VarAssign(name, expr)))
+}
+
 fn expr_statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
     let (input, res) = expr(input)?;
     Ok((input, Statement::Expression(res)))
 }
 
 fn statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
-    alt((var_def, expr_statement)).parse(input)
+    alt((var_def, var_assign, expr_statement)).parse(input)
 }
 
 fn statements(input: &'_ str) -> Result<Statements<'_>, nom::error::Error<&'_ str>> {
@@ -210,6 +218,13 @@ fn main() {
                 println!("eval: {:?}", eval(expr, &variables));
             }
             Statement::VarDef(name, expr) => {
+                let value = eval(expr, &variables);
+                variables.insert(name, value);
+            }
+            Statement::VarAssign(name, expr) => {
+                if !variables.contains_key(name) {
+                    panic!("Variable is not defined");
+                }
                 let value = eval(expr, &variables);
                 variables.insert(name, value);
             }
