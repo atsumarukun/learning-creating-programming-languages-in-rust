@@ -1,11 +1,13 @@
+use std::io::Read;
+
 use nom::{
-    IResult, Parser,
+    Finish, IResult, Parser,
     branch::alt,
     bytes::complete::tag,
     character::complete::{alpha1, alphanumeric1, char, multispace0},
     combinator::{opt, recognize},
     error::ParseError,
-    multi::{fold_many0, many0},
+    multi::{fold_many0, many0, separated_list0},
     number::complete::recognize_float,
     sequence::{delimited, pair},
 };
@@ -20,6 +22,8 @@ enum Expression<'src> {
     Mul(Box<Expression<'src>>, Box<Expression<'src>>),
     Div(Box<Expression<'src>>, Box<Expression<'src>>),
 }
+
+type Statements<'a> = Vec<Expression<'a>>;
 
 fn space_delimited<'src, O, E>(
     f: impl Parser<&'src str, Output = O, Error = E>,
@@ -105,6 +109,11 @@ fn expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
     .parse(input)
 }
 
+fn statements(input: &'_ str) -> Result<Statements<'_>, nom::error::Error<&'_ str>> {
+    let (_, res) = separated_list0(tag(";"), expr).parse(input).finish()?;
+    Ok(res)
+}
+
 fn unary_fn(f: fn(f64) -> f64) -> impl Fn(Vec<Expression>) -> f64 {
     move |args| {
         f(eval(
@@ -151,31 +160,17 @@ fn eval(expr: Expression) -> f64 {
 }
 
 fn main() {
-    fn ex_eval<'src>(input: &'src str) -> Result<f64, nom::Err<nom::error::Error<&'src str>>> {
-        expr(input).map(|(_, e)| eval(e))
+    let mut buf = String::new();
+    if std::io::stdin().read_to_string(&mut buf).is_ok() {
+        let parsed_statements = match statements(&buf) {
+            Ok(parsed_statements) => parsed_statements,
+            Err(e) => {
+                eprintln!("Parse error: {e:?}");
+                return;
+            }
+        };
+        for statement in parsed_statements {
+            println!("eval: {:?}", eval(statement));
+        }
     }
-
-    let input = "123";
-    println!("source: {:?}, parsed: {:?}", input, ex_eval(input));
-
-    let input = "2 * pi";
-    println!("source: {:?}, parsed: {:?}", input, ex_eval(input));
-
-    let input = "(123 + 456 ) + pi";
-    println!("source: {:?}, parsed: {:?}", input, ex_eval(input));
-
-    let input = "10 - (100 + 1)";
-    println!("source: {:?}, parsed: {:?}", input, ex_eval(input));
-
-    let input = "(3 + 7) / (2 + 3)";
-    println!("source: {:?}, parsed: {:?}", input, ex_eval(input));
-
-    let input = "sqrt(2) / 2";
-    println!("source: {:?}, parsed: {:?}", input, ex_eval(input));
-
-    let input = "sin(pi / 4)";
-    println!("source: {:?}, parsed: {:?}", input, ex_eval(input));
-
-    let input = "atan2(1, 1)";
-    println!("source: {:?}, parsed: {:?}", input, ex_eval(input));
 }
