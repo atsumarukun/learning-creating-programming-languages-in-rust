@@ -47,6 +47,8 @@ enum Statement<'src> {
         stmts: Statements<'src>,
     },
     Return(Expression<'src>),
+    Break,
+    Continue,
 }
 
 type Statements<'a> = Vec<Statement<'a>>;
@@ -76,7 +78,13 @@ impl<'src> FnDef<'src> {
                     .map(|(arg, name)| (name.to_string(), *arg))
                     .collect();
                 match eval_stmts(&code.stmts, &mut new_frame) {
-                    EvalResult::Continue(val) | EvalResult::Break(val) => val,
+                    EvalResult::Continue(val) | EvalResult::Break(BreakResult::Return(val)) => val,
+                    EvalResult::Break(BreakResult::Break) => {
+                        panic!("Breaking outside loop is prohibited")
+                    }
+                    EvalResult::Break(BreakResult::Continue) => {
+                        panic!("Continuing outside loop is prohibited")
+                    }
                 }
             }
             Self::Native(code) => (code.code)(args),
@@ -325,12 +333,29 @@ fn return_statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
     Ok((input, Statement::Return(ex)))
 }
 
+fn break_statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
+    let (input, _) = space_delimited(tag("break")).parse(input)?;
+    Ok((input, Statement::Break))
+}
+
+fn continue_statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
+    let (input, _) = space_delimited(tag("continue")).parse(input)?;
+    Ok((input, Statement::Continue))
+}
+
 fn statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
     alt((
         for_statement,
         fn_def_statement,
         terminated(
-            alt((var_def, var_assign, return_statement, expr_statement)),
+            alt((
+                var_def,
+                var_assign,
+                return_statement,
+                break_statement,
+                continue_statement,
+                expr_statement,
+            )),
             char(';'),
         ),
     ))
@@ -365,7 +390,14 @@ fn binary_fn<'a>(f: fn(f64, f64) -> f64) -> FnDef<'a> {
     })
 }
 
-type EvalResult = ControlFlow<f64, f64>;
+#[derive(Debug)]
+enum BreakResult {
+    Return(f64),
+    Break,
+    Continue,
+}
+
+type EvalResult = ControlFlow<BreakResult, f64>;
 
 fn eval<'src>(expr: &Expression<'src>, frame: &mut StackFrame<'src>) -> EvalResult {
     use Expression::*;
@@ -443,7 +475,14 @@ fn eval_stmts<'src>(stmts: &[Statement<'src>], frame: &mut StackFrame<'src>) -> 
                 let end = eval(end, frame)? as isize;
                 for i in start..end {
                     frame.vars.insert(loop_var.to_string(), i as f64);
-                    eval_stmts(stmts, frame)?;
+                    match eval_stmts(stmts, frame) {
+                        EvalResult::Continue(val) => last_result = EvalResult::Continue(val),
+                        EvalResult::Break(BreakResult::Return(val)) => {
+                            return EvalResult::Break(BreakResult::Return(val));
+                        }
+                        EvalResult::Break(BreakResult::Break) => break,
+                        EvalResult::Break(BreakResult::Continue) => continue,
+                    }
                 }
             }
             Statement::FnDef { name, args, stmts } => {
@@ -455,7 +494,11 @@ fn eval_stmts<'src>(stmts: &[Statement<'src>], frame: &mut StackFrame<'src>) -> 
                     }),
                 );
             }
-            Statement::Return(expr) => return EvalResult::Break(eval(expr, frame)?),
+            Statement::Return(expr) => {
+                return EvalResult::Break(BreakResult::Return(eval(expr, frame)?));
+            }
+            Statement::Break => return EvalResult::Break(BreakResult::Break),
+            Statement::Continue => return EvalResult::Break(BreakResult::Continue),
         }
     }
     last_result
