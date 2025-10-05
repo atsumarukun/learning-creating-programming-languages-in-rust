@@ -1,5 +1,5 @@
 use nom::{
-    IResult, Parser,
+    Finish, IResult, Parser,
     branch::alt,
     bytes::complete::tag,
     character::complete::{alpha1, alphanumeric1, char, multispace0},
@@ -7,9 +7,10 @@ use nom::{
     error::ParseError,
     multi::{fold_many0, many0},
     number::complete::recognize_float,
-    sequence::{delimited, pair, preceded},
+    sequence::{delimited, pair, preceded, terminated},
 };
 use std::{
+    error::Error,
     fmt::Display,
     io::{BufReader, BufWriter, Read, Write},
     usize,
@@ -32,6 +33,23 @@ enum Expression<'src> {
         Option<Box<Expression<'src>>>,
     ),
 }
+
+#[derive(Debug, PartialEq, Clone)]
+enum Statement<'src> {
+    Expression(Expression<'src>),
+    VarDef(&'src str, Expression<'src>),
+    VarAssign(&'src str, Expression<'src>),
+    For {
+        loop_var: &'src str,
+        start: Expression<'src>,
+        end: Expression<'src>,
+        stmts: Statements<'src>,
+    },
+    Break,
+    Continue,
+}
+
+type Statements<'a> = Vec<Statement<'a>>;
 
 fn space_delimited<'src, O, E>(
     f: impl Parser<&'src str, Output = O, Error = E>,
@@ -162,6 +180,83 @@ fn expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
     alt((if_expr, cond_expr, num_expr)).parse(input)
 }
 
+fn var_def(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
+    let (input, _) = space_delimited(tag("var")).parse(input)?;
+    let (input, name) = space_delimited(identifier).parse(input)?;
+    let (input, _) = space_delimited(char('=')).parse(input)?;
+    let (input, expr) = space_delimited(expr).parse(input)?;
+    Ok((input, Statement::VarDef(name, expr)))
+}
+
+fn var_assign(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
+    let (input, name) = space_delimited(identifier).parse(input)?;
+    let (input, _) = space_delimited(char('=')).parse(input)?;
+    let (input, expr) = space_delimited(expr).parse(input)?;
+    Ok((input, Statement::VarAssign(name, expr)))
+}
+
+fn expr_statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
+    let (input, res) = expr(input)?;
+    Ok((input, Statement::Expression(res)))
+}
+
+fn for_statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
+    let (input, _) = space_delimited(tag("for")).parse(input)?;
+    let (input, loop_var) = space_delimited(identifier).parse(input)?;
+    let (input, _) = space_delimited(tag("in")).parse(input)?;
+    let (input, start) = space_delimited(expr).parse(input)?;
+    let (input, _) = space_delimited(tag("to")).parse(input)?;
+    let (input, end) = space_delimited(expr).parse(input)?;
+    let (input, stmts) = delimited(open_brace, statements, close_brace).parse(input)?;
+    Ok((
+        input,
+        Statement::For {
+            loop_var,
+            start,
+            end,
+            stmts,
+        },
+    ))
+}
+
+fn break_statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
+    let (input, _) = space_delimited(tag("break")).parse(input)?;
+    Ok((input, Statement::Break))
+}
+
+fn continue_statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
+    let (input, _) = space_delimited(tag("continue")).parse(input)?;
+    Ok((input, Statement::Continue))
+}
+
+fn statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
+    alt((
+        for_statement,
+        terminated(
+            alt((
+                var_def,
+                var_assign,
+                break_statement,
+                continue_statement,
+                expr_statement,
+            )),
+            char(';'),
+        ),
+    ))
+    .parse(input)
+}
+
+fn statements(input: &'_ str) -> IResult<&'_ str, Statements<'_>> {
+    let (input, stmts) = many0(statement).parse(input)?;
+    let (input, _) = opt(char(';')).parse(input)?;
+    Ok((input, stmts))
+}
+
+fn statements_finish(input: &'_ str) -> Result<Statements<'_>, nom::error::Error<&'_ str>> {
+    let (_, res) = statements(input).finish()?;
+    Ok(res)
+}
+
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum OpCode {
@@ -177,6 +272,7 @@ pub enum OpCode {
     Jf,
     Lt,
     Pop,
+    Dup,
 }
 
 macro_rules! impl_op_from {
@@ -206,7 +302,8 @@ impl_op_from!(
     Jmp,
     Jf,
     Lt,
-    Pop
+    Pop,
+    Dup
 );
 
 #[repr(C)]
@@ -336,10 +433,47 @@ struct StkIdx(usize);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct InstPtr(usize);
 
+#[derive(Debug, Clone, Default)]
+enum Target {
+    #[default]
+    Temp,
+    Literal(usize),
+    Local(String),
+}
+
+#[derive(Debug)]
+struct LoopFrame {
+    start: StkIdx,
+    break_ips: Vec<InstPtr>,
+    continue_ips: Vec<(InstPtr, usize)>,
+}
+
+impl LoopFrame {
+    fn new(start: StkIdx) -> Self {
+        Self {
+            start,
+            break_ips: vec![],
+            continue_ips: vec![],
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LoopStackUnderflowError;
+
+impl Display for LoopStackUnderflowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "A break statement outside loop")
+    }
+}
+
+impl Error for LoopStackUnderflowError {}
+
 struct Compiler {
     literals: Vec<Value>,
     instructions: Vec<Instruction>,
-    target_stack: Vec<usize>,
+    target_stack: Vec<Target>,
+    loop_stack: Vec<LoopFrame>,
 }
 
 impl Compiler {
@@ -348,6 +482,7 @@ impl Compiler {
             literals: vec![],
             instructions: vec![],
             target_stack: vec![],
+            loop_stack: vec![],
         }
     }
 
@@ -372,7 +507,7 @@ impl Compiler {
             OpCode::Copy,
             (self.target_stack.len() - stack_idx.0 - 1) as u8,
         );
-        self.target_stack.push(0);
+        self.target_stack.push(Target::Temp);
         inst
     }
 
@@ -403,8 +538,14 @@ impl Compiler {
             OpCode::Pop,
             (self.target_stack.len() - stack_idx.0 - 1) as u8,
         );
-        self.target_stack.resize(stack_idx.0 + 1, 0);
+        self.target_stack.resize(stack_idx.0 + 1, Target::Temp);
         Some(inst)
+    }
+
+    fn add_load_literal_inst(&mut self, lit: u8) -> InstPtr {
+        let inst = self.add_inst(OpCode::LoadLiteral, lit);
+        self.target_stack.push(Target::Literal(lit as usize));
+        inst
     }
 
     fn coerce_stack(&mut self, target: StkIdx) {
@@ -434,73 +575,202 @@ impl Compiler {
         Ok(())
     }
 
-    fn bin_op(&mut self, op: OpCode, lhs: &Expression, rhs: &Expression) -> StkIdx {
-        let lhs = self.compile_expr(lhs);
-        let rhs = self.compile_expr(rhs);
+    fn bin_op(
+        &mut self,
+        op: OpCode,
+        lhs: &Expression,
+        rhs: &Expression,
+    ) -> Result<StkIdx, Box<dyn Error>> {
+        let lhs = self.compile_expr(lhs)?;
+        let rhs = self.compile_expr(rhs)?;
         self.add_copy_inst(lhs);
         self.add_copy_inst(rhs);
         self.add_inst(op, 0);
         self.target_stack.pop();
-        self.stack_top()
+        self.target_stack.pop();
+        self.target_stack.push(Target::Temp);
+        Ok(self.stack_top())
     }
 
-    fn compile_expr(&mut self, ex: &Expression) -> StkIdx {
-        match ex {
+    fn compile_expr(&mut self, ex: &Expression) -> Result<StkIdx, Box<dyn Error>> {
+        Ok(match ex {
             Expression::NumLiteral(num) => {
                 let id = self.add_literal(Value::F64(*num));
-                self.add_inst(OpCode::LoadLiteral, id);
-                self.target_stack.push(id as usize);
+                self.add_load_literal_inst(id);
                 self.stack_top()
             }
-            Expression::Ident("pi") => {
-                let id = self.add_literal(Value::F64(std::f64::consts::PI));
-                self.add_inst(OpCode::LoadLiteral, id);
-                self.target_stack.push(id as usize);
-                self.stack_top()
+            Expression::Ident(ident) => {
+                let var = self.target_stack.iter().enumerate().find(|(_i, tgt)| {
+                    if let Target::Local(id) = tgt {
+                        id == ident
+                    } else {
+                        false
+                    }
+                });
+                if let Some(var) = var {
+                    return Ok(StkIdx(var.0));
+                } else {
+                    return Err(format!("Variable not found: {ident:?}").into());
+                }
             }
-            Expression::Ident(id) => panic!("Unknown identifer {id:?}"),
-            Expression::Add(lhs, rhs) => self.bin_op(OpCode::Add, lhs, rhs),
-            Expression::Sub(lhs, rhs) => self.bin_op(OpCode::Sub, lhs, rhs),
-            Expression::Mul(lhs, rhs) => self.bin_op(OpCode::Mul, lhs, rhs),
-            Expression::Div(lhs, rhs) => self.bin_op(OpCode::Div, lhs, rhs),
+            Expression::Add(lhs, rhs) => self.bin_op(OpCode::Add, lhs, rhs)?,
+            Expression::Sub(lhs, rhs) => self.bin_op(OpCode::Sub, lhs, rhs)?,
+            Expression::Mul(lhs, rhs) => self.bin_op(OpCode::Mul, lhs, rhs)?,
+            Expression::Div(lhs, rhs) => self.bin_op(OpCode::Div, lhs, rhs)?,
             Expression::FnInvoke(name, args) => {
-                let stack_before_call = self.target_stack.len();
+                let stack_before_args = self.target_stack.len();
                 let name = self.add_literal(Value::Str(name.to_string()));
                 let args = args
                     .iter()
                     .map(|arg| self.compile_expr(arg))
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>, _>>()?;
 
-                self.add_inst(OpCode::LoadLiteral, name);
-                self.target_stack.push(0);
+                let stack_before_call = self.target_stack.len();
+                self.add_load_literal_inst(name);
                 for arg in &args {
                     self.add_copy_inst(*arg);
                 }
 
                 self.add_inst(OpCode::Call, args.len() as u8);
-                self.target_stack.resize(stack_before_call + 1, 0);
+                self.target_stack
+                    .resize(stack_before_call + 1, Target::Temp);
+                self.coerce_stack(StkIdx(stack_before_args));
                 self.stack_top()
             }
-            Expression::Lt(lhs, rhs) => self.bin_op(OpCode::Lt, lhs, rhs),
-            Expression::Gt(lhs, rhs) => self.bin_op(OpCode::Lt, rhs, lhs),
+            Expression::Lt(lhs, rhs) => self.bin_op(OpCode::Lt, lhs, rhs)?,
+            Expression::Gt(lhs, rhs) => self.bin_op(OpCode::Lt, rhs, lhs)?,
             Expression::If(cond, true_branch, false_branch) => {
-                let cond = self.compile_expr(cond);
+                let cond = self.compile_expr(cond)?;
                 self.add_copy_inst(cond);
                 let jf_inst = self.add_jf_inst();
                 let stack_size_before = self.target_stack.len();
-                self.compile_expr(true_branch);
+                self.compile_expr(true_branch)?;
                 self.coerce_stack(StkIdx(stack_size_before + 1));
                 let jmp_inst = self.add_inst(OpCode::Jmp, 0);
                 self.fixup_jmp(jf_inst);
-                self.target_stack.resize(stack_size_before, 0);
+                self.target_stack.resize(stack_size_before, Target::Temp);
                 if let Some(false_branch) = false_branch.as_ref() {
-                    self.compile_expr(&false_branch);
+                    self.compile_expr(&false_branch)?;
                 }
                 self.coerce_stack(StkIdx(stack_size_before + 1));
                 self.fixup_jmp(jmp_inst);
                 self.stack_top()
             }
+        })
+    }
+
+    fn fixup_breaks(&mut self) -> Result<(), Box<dyn Error>> {
+        let loop_frame = self.loop_stack.pop().ok_or(LoopStackUnderflowError)?;
+        let break_jmp_addr = self.instructions.len();
+        for ip in loop_frame.break_ips {
+            self.instructions[ip.0].arg0 = break_jmp_addr as u8;
         }
+        Ok(())
+    }
+
+    fn fixup_continues(&mut self) -> Result<(), Box<dyn Error>> {
+        let loop_frame = self.loop_stack.last().ok_or(LoopStackUnderflowError)?;
+        let continue_jmp_addr = self.instructions.len();
+        for (ip, stk) in &loop_frame.continue_ips {
+            self.instructions[ip.0].arg0 = (self.target_stack.len() - stk) as u8;
+            self.instructions[ip.0 + 1].arg0 = continue_jmp_addr as u8;
+        }
+        Ok(())
+    }
+
+    fn add_binop_inst(&mut self, op: OpCode) -> InstPtr {
+        self.target_stack.pop();
+        self.add_inst(op, 0)
+    }
+
+    fn compile_stmts(&mut self, stmts: &Statements) -> Result<Option<StkIdx>, Box<dyn Error>> {
+        let mut last_result = None;
+        for stmt in stmts {
+            match stmt {
+                Statement::Expression(ex) => last_result = Some(self.compile_expr(ex)?),
+                Statement::VarDef(vname, ex) => {
+                    let ex = self.compile_expr(ex)?;
+                    self.target_stack[ex.0] = Target::Local(vname.to_string());
+                }
+                Statement::VarAssign(vname, ex) => {
+                    let stk_ex = self.compile_expr(ex)?;
+                    let (stk_local, _) = self
+                        .target_stack
+                        .iter_mut()
+                        .enumerate()
+                        .find(|(_, tgt)| {
+                            if let Target::Local(tgt) = tgt {
+                                tgt == vname
+                            } else {
+                                false
+                            }
+                        })
+                        .ok_or_else(|| format!("Variable name not found: {vname}"))?;
+                    self.add_copy_inst(stk_ex);
+                    self.add_store_inst(StkIdx(stk_local));
+                }
+                Statement::For {
+                    loop_var,
+                    start,
+                    end,
+                    stmts,
+                } => {
+                    let stk_start = self.compile_expr(start)?;
+                    let stk_end = self.compile_expr(end)?;
+                    self.add_copy_inst(stk_start);
+                    let stk_loop_var = self.stack_top();
+                    self.target_stack[stk_loop_var.0] = Target::Local(loop_var.to_string());
+                    let inst_check_exit = self.instructions.len();
+                    self.add_copy_inst(stk_loop_var);
+                    self.add_copy_inst(stk_end);
+                    self.add_binop_inst(OpCode::Lt);
+                    let jf_inst = self.add_jf_inst();
+                    self.loop_stack.push(LoopFrame::new(stk_loop_var));
+                    self.compile_stmts(stmts)?;
+                    self.fixup_continues()?;
+                    let one = self.add_literal(Value::F64(1.));
+                    self.add_copy_inst(stk_loop_var);
+                    self.add_load_literal_inst(one);
+                    self.add_inst(OpCode::Add, 0);
+                    self.target_stack.pop();
+                    self.add_store_inst(stk_loop_var);
+                    self.add_pop_until_inst(stk_loop_var);
+                    self.add_inst(OpCode::Jmp, inst_check_exit as u8);
+                    self.fixup_jmp(jf_inst);
+                    self.fixup_breaks()?;
+                }
+                Statement::Break => {
+                    let start = self
+                        .loop_stack
+                        .last()
+                        .map(|loop_frame| loop_frame.start)
+                        .ok_or(LoopStackUnderflowError)?;
+                    self.add_pop_until_inst(start);
+
+                    let loop_frame = self.loop_stack.last_mut().ok_or(LoopStackUnderflowError)?;
+                    let break_ip = self.instructions.len();
+                    loop_frame.break_ips.push(InstPtr(break_ip));
+                    self.add_inst(OpCode::Jmp, 0);
+                }
+                Statement::Continue => {
+                    let start = self
+                        .loop_stack
+                        .last()
+                        .map(|frame| frame.start)
+                        .ok_or(LoopStackUnderflowError)?;
+                    self.add_pop_until_inst(start);
+
+                    let loop_frame = self.loop_stack.last_mut().ok_or(LoopStackUnderflowError)?;
+                    let continue_ip = self.instructions.len();
+                    loop_frame
+                        .continue_ips
+                        .push((InstPtr(continue_ip), self.target_stack.len()));
+                    self.add_inst(OpCode::Dup, 0);
+                    self.add_inst(OpCode::Jmp, 0);
+                }
+            }
+        }
+        Ok(last_result)
     }
 
     fn disasm(&self, writer: &mut impl Write) -> std::io::Result<()> {
@@ -518,7 +788,7 @@ impl Compiler {
                     " [{i}] {:?} {} ({:?})",
                     inst.op, inst.arg0, self.literals[inst.arg0 as usize]
                 )?,
-                Copy | Call | Jmp | Jf | Pop | Store => {
+                Copy | Call | Jmp | Jf | Pop | Store | Dup => {
                     writeln!(writer, " [{i}] {:?} {}", inst.op, inst.arg0)?
                 }
                 _ => writeln!(writer, " [{i}] {:?}", inst.op)?,
@@ -555,6 +825,14 @@ fn binary_fn(f: fn(f64, f64) -> f64) -> impl Fn(&[Value]) -> Value {
             .coerce_f64();
         Value::F64(f(lhs, rhs))
     }
+}
+
+fn print_fn(args: &[Value]) -> Value {
+    for arg in args {
+        print!("{:?} ", arg);
+    }
+    println!("");
+    Value::F64(0.)
 }
 
 struct ByteCode {
@@ -627,6 +905,7 @@ impl ByteCode {
                         "exp" => unary_fn(f64::exp)(args),
                         "log" => binary_fn(f64::log)(args),
                         "log10" => unary_fn(f64::log10)(args),
+                        "print" => print_fn(args),
                         _ => panic!("Unknown function name {fname:?}"),
                     };
                     stack.resize(stack.len() - instruction.arg0 as usize - 1, Value::F64(0.));
@@ -636,7 +915,10 @@ impl ByteCode {
                     let idx = stack.len() - instruction.arg0 as usize - 1;
                     stack[idx] = stack.pop().expect("Store needs an argument");
                 }
-                OpCode::Jmp => ip = instruction.arg0 as usize,
+                OpCode::Jmp => {
+                    ip = instruction.arg0 as usize;
+                    continue;
+                }
                 OpCode::Jf => {
                     let cond = stack.pop().expect("If needs an argument");
                     if cond.coerce_f64() == 0. {
@@ -650,11 +932,14 @@ impl ByteCode {
                 OpCode::Pop => {
                     stack.resize(stack.len() - instruction.arg0 as usize, Value::default())
                 }
+                OpCode::Dup => {
+                    let top = stack.last().unwrap().clone();
+                    stack.extend((0..instruction.arg0).map(|_| top.clone()));
+                }
             }
             ip += 1;
         }
 
-        println!("{stack:?}");
         stack.pop()
     }
 }
@@ -671,12 +956,12 @@ fn write_program(
     writer: &mut impl Write,
     out_file: &str,
     disasm: bool,
-) -> std::io::Result<()> {
+) -> Result<(), Box<dyn Error>> {
     let mut compiler = Compiler::new();
-    let (_, ex) =
-        expr(source).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_owned()))?;
+    let stmts = statements_finish(source)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-    compiler.compile_expr(&ex);
+    compiler.compile_stmts(&stmts)?;
 
     if disasm {
         compiler.disasm(&mut std::io::stdout())?;
@@ -693,7 +978,7 @@ fn write_program(
     Ok(())
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args();
     args.next();
     match args.next().as_ref().map(|s| s as &str) {
@@ -715,8 +1000,7 @@ fn main() -> std::io::Result<()> {
             let reader = std::fs::File::open("bytecode.bin")?;
             let mut reader = BufReader::new(reader);
             if let Ok(bytecode) = read_program(&mut reader) {
-                let result = bytecode.interpret();
-                println!("result: {result:?}");
+                let _ = bytecode.interpret();
             }
         }
         _ => println!("Please specify -c or -r as an argument"),
