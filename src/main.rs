@@ -7,7 +7,7 @@ use nom::{
     error::ParseError,
     multi::{fold_many0, many0},
     number::complete::recognize_float,
-    sequence::{delimited, pair},
+    sequence::{delimited, pair, preceded},
 };
 use std::{
     fmt::Display,
@@ -24,6 +24,13 @@ enum Expression<'src> {
     Sub(Box<Expression<'src>>, Box<Expression<'src>>),
     Mul(Box<Expression<'src>>, Box<Expression<'src>>),
     Div(Box<Expression<'src>>, Box<Expression<'src>>),
+    Gt(Box<Expression<'src>>, Box<Expression<'src>>),
+    Lt(Box<Expression<'src>>, Box<Expression<'src>>),
+    If(
+        Box<Expression<'src>>,
+        Box<Expression<'src>>,
+        Option<Box<Expression<'src>>>,
+    ),
 }
 
 fn space_delimited<'src, O, E>(
@@ -33,6 +40,16 @@ where
     E: ParseError<&'src str>,
 {
     delimited(multispace0, f, multispace0)
+}
+
+fn open_brace(input: &str) -> IResult<&str, ()> {
+    let (input, _) = space_delimited(char('{')).parse(input)?;
+    Ok((input, ()))
+}
+
+fn close_brace(input: &str) -> IResult<&str, ()> {
+    let (input, _) = space_delimited(char('}')).parse(input)?;
+    Ok((input, ()))
 }
 
 fn number(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
@@ -95,7 +112,7 @@ fn term(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
     .parse(input)
 }
 
-fn expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
+fn num_expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
     let (input, init) = term(input)?;
 
     fold_many0(
@@ -110,6 +127,41 @@ fn expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
     .parse(input)
 }
 
+fn cond_expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
+    let (input, first) = num_expr(input)?;
+    let (input, cond) = space_delimited(alt((char('<'), char('>')))).parse(input)?;
+    let (input, second) = num_expr(input)?;
+
+    Ok((
+        input,
+        match cond {
+            '<' => Expression::Lt(Box::new(first), Box::new(second)),
+            '>' => Expression::Gt(Box::new(first), Box::new(second)),
+            _ => unreachable!(),
+        },
+    ))
+}
+
+fn if_expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
+    let (input, _) = space_delimited(tag("if")).parse(input)?;
+    let (input, cond) = expr(input)?;
+    let (input, t_case) = delimited(open_brace, expr, close_brace).parse(input)?;
+    let (input, f_case) = opt(preceded(
+        space_delimited(tag("else")),
+        alt((delimited(open_brace, expr, close_brace), if_expr)),
+    ))
+    .parse(input)?;
+
+    Ok((
+        input,
+        Expression::If(Box::new(cond), Box::new(t_case), f_case.map(Box::new)),
+    ))
+}
+
+fn expr(input: &'_ str) -> IResult<&'_ str, Expression<'_>> {
+    alt((if_expr, cond_expr, num_expr)).parse(input)
+}
+
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum OpCode {
@@ -120,6 +172,11 @@ pub enum OpCode {
     Mul,
     Div,
     Call,
+    Store,
+    Jmp,
+    Jf,
+    Lt,
+    Pop,
 }
 
 macro_rules! impl_op_from {
@@ -137,7 +194,20 @@ macro_rules! impl_op_from {
         }
     };
 }
-impl_op_from!(LoadLiteral, Copy, Add, Sub, Mul, Div, Call);
+impl_op_from!(
+    LoadLiteral,
+    Copy,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Call,
+    Store,
+    Jmp,
+    Jf,
+    Lt,
+    Pop
+);
 
 #[repr(C)]
 struct Instruction {
@@ -185,10 +255,16 @@ enum ValueKind {
     Str,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum Value {
     F64(f64),
     Str(String),
+}
+
+impl Default for Value {
+    fn default() -> Self {
+        Self::F64(0.)
+    }
 }
 
 impl Display for Value {
@@ -254,6 +330,12 @@ impl Value {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct StkIdx(usize);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct InstPtr(usize);
+
 struct Compiler {
     literals: Vec<Value>,
     instructions: Vec<Instruction>,
@@ -269,25 +351,71 @@ impl Compiler {
         }
     }
 
+    fn stack_top(&self) -> StkIdx {
+        StkIdx(self.target_stack.len() - 1)
+    }
+
     fn add_literal(&mut self, value: Value) -> u8 {
         let ret = self.literals.len();
         self.literals.push(value);
         ret as u8
     }
 
-    fn add_inst(&mut self, op: OpCode, arg0: u8) -> usize {
+    fn add_inst(&mut self, op: OpCode, arg0: u8) -> InstPtr {
         let inst = self.instructions.len();
         self.instructions.push(Instruction { op, arg0 });
-        inst
+        InstPtr(inst)
     }
 
-    fn add_copy_inst(&mut self, stack_idx: usize) -> usize {
+    fn add_copy_inst(&mut self, stack_idx: StkIdx) -> InstPtr {
         let inst = self.add_inst(
             OpCode::Copy,
-            (self.target_stack.len() - stack_idx - 1) as u8,
+            (self.target_stack.len() - stack_idx.0 - 1) as u8,
         );
         self.target_stack.push(0);
         inst
+    }
+
+    fn add_store_inst(&mut self, stack_idx: StkIdx) -> InstPtr {
+        let inst = self.add_inst(
+            OpCode::Store,
+            (self.target_stack.len() - stack_idx.0 - 1) as u8,
+        );
+        self.target_stack.pop();
+        inst
+    }
+
+    fn add_jf_inst(&mut self) -> InstPtr {
+        let inst = self.add_inst(OpCode::Jf, 0);
+        self.target_stack.pop();
+        inst
+    }
+
+    fn fixup_jmp(&mut self, ip: InstPtr) {
+        self.instructions[ip.0].arg0 = self.instructions.len() as u8;
+    }
+
+    fn add_pop_until_inst(&mut self, stack_idx: StkIdx) -> Option<InstPtr> {
+        if self.target_stack.len() <= stack_idx.0 {
+            return None;
+        }
+        let inst = self.add_inst(
+            OpCode::Pop,
+            (self.target_stack.len() - stack_idx.0 - 1) as u8,
+        );
+        self.target_stack.resize(stack_idx.0 + 1, 0);
+        Some(inst)
+    }
+
+    fn coerce_stack(&mut self, target: StkIdx) {
+        if target.0 < self.target_stack.len() - 1 {
+            self.add_store_inst(target);
+            self.add_pop_until_inst(target);
+        } else if self.target_stack.len() - 1 < target.0 {
+            for _ in self.target_stack.len() - 1..target.0 {
+                self.add_copy_inst(self.stack_top());
+            }
+        }
     }
 
     fn write_literals(&self, writer: &mut impl Write) -> std::io::Result<()> {
@@ -306,29 +434,29 @@ impl Compiler {
         Ok(())
     }
 
-    fn bin_op(&mut self, op: OpCode, lhs: &Expression, rhs: &Expression) -> usize {
+    fn bin_op(&mut self, op: OpCode, lhs: &Expression, rhs: &Expression) -> StkIdx {
         let lhs = self.compile_expr(lhs);
         let rhs = self.compile_expr(rhs);
         self.add_copy_inst(lhs);
         self.add_copy_inst(rhs);
         self.add_inst(op, 0);
         self.target_stack.pop();
-        self.target_stack.len() - 1
+        self.stack_top()
     }
 
-    fn compile_expr(&mut self, ex: &Expression) -> usize {
+    fn compile_expr(&mut self, ex: &Expression) -> StkIdx {
         match ex {
             Expression::NumLiteral(num) => {
                 let id = self.add_literal(Value::F64(*num));
                 self.add_inst(OpCode::LoadLiteral, id);
                 self.target_stack.push(id as usize);
-                self.target_stack.len() - 1
+                self.stack_top()
             }
             Expression::Ident("pi") => {
                 let id = self.add_literal(Value::F64(std::f64::consts::PI));
                 self.add_inst(OpCode::LoadLiteral, id);
                 self.target_stack.push(id as usize);
-                self.target_stack.len() - 1
+                self.stack_top()
             }
             Expression::Ident(id) => panic!("Unknown identifer {id:?}"),
             Expression::Add(lhs, rhs) => self.bin_op(OpCode::Add, lhs, rhs),
@@ -351,7 +479,26 @@ impl Compiler {
 
                 self.add_inst(OpCode::Call, args.len() as u8);
                 self.target_stack.resize(stack_before_call + 1, 0);
-                self.target_stack.len() - 1
+                self.stack_top()
+            }
+            Expression::Lt(lhs, rhs) => self.bin_op(OpCode::Lt, lhs, rhs),
+            Expression::Gt(lhs, rhs) => self.bin_op(OpCode::Lt, rhs, lhs),
+            Expression::If(cond, true_branch, false_branch) => {
+                let cond = self.compile_expr(cond);
+                self.add_copy_inst(cond);
+                let jf_inst = self.add_jf_inst();
+                let stack_size_before = self.target_stack.len();
+                self.compile_expr(true_branch);
+                self.coerce_stack(StkIdx(stack_size_before + 1));
+                let jmp_inst = self.add_inst(OpCode::Jmp, 0);
+                self.fixup_jmp(jf_inst);
+                self.target_stack.resize(stack_size_before, 0);
+                if let Some(false_branch) = false_branch.as_ref() {
+                    self.compile_expr(&false_branch);
+                }
+                self.coerce_stack(StkIdx(stack_size_before + 1));
+                self.fixup_jmp(jmp_inst);
+                self.stack_top()
             }
         }
     }
@@ -371,7 +518,9 @@ impl Compiler {
                     " [{i}] {:?} {} ({:?})",
                     inst.op, inst.arg0, self.literals[inst.arg0 as usize]
                 )?,
-                Copy | Call => writeln!(writer, " [{i}] {:?} {}", inst.op, inst.arg0)?,
+                Copy | Call | Jmp | Jf | Pop | Store => {
+                    writeln!(writer, " [{i}] {:?} {}", inst.op, inst.arg0)?
+                }
                 _ => writeln!(writer, " [{i}] {:?}", inst.op)?,
             }
         }
@@ -446,8 +595,10 @@ impl ByteCode {
 
     fn interpret(&self) -> Option<Value> {
         let mut stack = vec![];
+        let mut ip = 0;
 
-        for instruction in &self.instructions {
+        while ip < self.instructions.len() {
+            let instruction = &self.instructions[ip];
             match instruction.op {
                 OpCode::LoadLiteral => stack.push(self.literals[instruction.arg0 as usize].clone()),
                 OpCode::Add => self.interpret_bin_op(&mut stack, |lhs, rhs| lhs + rhs),
@@ -481,9 +632,29 @@ impl ByteCode {
                     stack.resize(stack.len() - instruction.arg0 as usize - 1, Value::F64(0.));
                     stack.push(res);
                 }
+                OpCode::Store => {
+                    let idx = stack.len() - instruction.arg0 as usize - 1;
+                    stack[idx] = stack.pop().expect("Store needs an argument");
+                }
+                OpCode::Jmp => ip = instruction.arg0 as usize,
+                OpCode::Jf => {
+                    let cond = stack.pop().expect("If needs an argument");
+                    if cond.coerce_f64() == 0. {
+                        ip = instruction.arg0 as usize;
+                        continue;
+                    }
+                }
+                OpCode::Lt => {
+                    self.interpret_bin_op(&mut stack, |lhs, rhs| (lhs < rhs) as i32 as f64)
+                }
+                OpCode::Pop => {
+                    stack.resize(stack.len() - instruction.arg0 as usize, Value::default())
+                }
             }
+            ip += 1;
         }
 
+        println!("{stack:?}");
         stack.pop()
     }
 }
