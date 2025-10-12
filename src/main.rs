@@ -5,11 +5,12 @@ use nom::{
     character::complete::{alpha1, alphanumeric1, char, multispace0},
     combinator::{opt, recognize},
     error::ParseError,
-    multi::{fold_many0, many0},
+    multi::{fold_many0, many0, separated_list0},
     number::complete::recognize_float,
     sequence::{delimited, pair, preceded, terminated},
 };
 use std::{
+    collections::HashMap,
     error::Error,
     fmt::Display,
     io::{BufReader, BufWriter, Read, Write},
@@ -47,6 +48,11 @@ enum Statement<'src> {
     },
     Break,
     Continue,
+    FnDef {
+        name: &'src str,
+        args: Vec<&'src str>,
+        stmts: Statements<'src>,
+    },
 }
 
 type Statements<'a> = Vec<Statement<'a>>;
@@ -229,9 +235,20 @@ fn continue_statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
     Ok((input, Statement::Continue))
 }
 
+fn fn_def_statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
+    let (input, _) = space_delimited(tag("fn")).parse(input)?;
+    let (input, name) = space_delimited(identifier).parse(input)?;
+    let (input, _) = space_delimited(tag("(")).parse(input)?;
+    let (input, args) = separated_list0(char(','), space_delimited(identifier)).parse(input)?;
+    let (input, _) = space_delimited(tag(")")).parse(input)?;
+    let (input, stmts) = delimited(open_brace, statements, close_brace).parse(input)?;
+    Ok((input, Statement::FnDef { name, args, stmts }))
+}
+
 fn statement(input: &'_ str) -> IResult<&'_ str, Statement<'_>> {
     alt((
         for_statement,
+        fn_def_statement,
         terminated(
             alt((
                 var_def,
@@ -469,10 +486,89 @@ impl Display for LoopStackUnderflowError {
 
 impl Error for LoopStackUnderflowError {}
 
+struct FnDef {
+    args: Vec<String>,
+    literals: Vec<Value>,
+    instructions: Vec<Instruction>,
+}
+
+impl FnDef {
+    fn write_args(args: &[String], writer: &mut impl Write) -> std::io::Result<()> {
+        serialize_size(args.len(), writer)?;
+        for arg in args {
+            serialize_str(arg, writer)?;
+        }
+        Ok(())
+    }
+
+    fn write_literals(literals: &[Value], writer: &mut impl Write) -> std::io::Result<()> {
+        serialize_size(literals.len(), writer)?;
+        for value in literals {
+            value.serialize(writer)?;
+        }
+        Ok(())
+    }
+
+    fn write_insts(instructions: &[Instruction], writer: &mut impl Write) -> std::io::Result<()> {
+        serialize_size(instructions.len(), writer)?;
+        for instruction in instructions {
+            instruction.serialize(writer)?;
+        }
+        Ok(())
+    }
+
+    fn serialize(&self, writer: &mut impl Write) -> std::io::Result<()> {
+        Self::write_args(&self.args, writer)?;
+        Self::write_literals(&self.literals, writer)?;
+        Self::write_insts(&*self.instructions, writer)?;
+        Ok(())
+    }
+
+    fn read_args(reader: &mut impl Read) -> std::io::Result<Vec<String>> {
+        let num_args = deserialize_size(reader)?;
+        let mut args = Vec::with_capacity(num_args);
+        for _ in 0..num_args {
+            args.push(deserialize_str(reader)?);
+        }
+        Ok(args)
+    }
+
+    fn read_literals(reader: &mut impl Read) -> std::io::Result<Vec<Value>> {
+        let num_literals = deserialize_size(reader)?;
+        let mut literals = Vec::with_capacity(num_literals);
+        for _ in 0..num_literals {
+            literals.push(Value::deserialize(reader)?);
+        }
+        Ok(literals)
+    }
+
+    fn read_instructions(reader: &mut impl Read) -> std::io::Result<Vec<Instruction>> {
+        let num_instructions = deserialize_size(reader)?;
+        let mut instructions = Vec::with_capacity(num_instructions);
+        for _ in 0..num_instructions {
+            let inst = Instruction::deserialize(reader)?;
+            instructions.push(inst);
+        }
+        Ok(instructions)
+    }
+
+    fn deserialize(reader: &mut impl Read) -> std::io::Result<Self> {
+        let args = Self::read_args(reader)?;
+        let literals = Self::read_literals(reader)?;
+        let instructions = Self::read_instructions(reader)?;
+        Ok(Self {
+            args,
+            literals,
+            instructions,
+        })
+    }
+}
+
 struct Compiler {
     literals: Vec<Value>,
     instructions: Vec<Instruction>,
     target_stack: Vec<Target>,
+    funcs: HashMap<String, FnDef>,
     loop_stack: Vec<LoopFrame>,
 }
 
@@ -482,6 +578,7 @@ impl Compiler {
             literals: vec![],
             instructions: vec![],
             target_stack: vec![],
+            funcs: HashMap::new(),
             loop_stack: vec![],
         }
     }
@@ -548,6 +645,17 @@ impl Compiler {
         inst
     }
 
+    fn add_fn(&mut self, name: String, args: &[&str]) {
+        self.funcs.insert(
+            name,
+            FnDef {
+                args: args.iter().map(|arg| arg.to_string()).collect(),
+                literals: std::mem::take(&mut self.literals),
+                instructions: std::mem::take(&mut self.instructions),
+            },
+        );
+    }
+
     fn coerce_stack(&mut self, target: StkIdx) {
         if target.0 < self.target_stack.len() - 1 {
             self.add_store_inst(target);
@@ -559,18 +667,11 @@ impl Compiler {
         }
     }
 
-    fn write_literals(&self, writer: &mut impl Write) -> std::io::Result<()> {
-        serialize_size(self.literals.len(), writer)?;
-        for value in &self.literals {
-            value.serialize(writer)?;
-        }
-        Ok(())
-    }
-
-    fn write_instructions(&self, writer: &mut impl Write) -> std::io::Result<()> {
-        serialize_size(self.instructions.len(), writer)?;
-        for instruction in &self.instructions {
-            instruction.serialize(writer).unwrap();
+    fn write_funcs(&self, writer: &mut impl Write) -> std::io::Result<()> {
+        serialize_size(self.funcs.len(), writer)?;
+        for (name, func) in &self.funcs {
+            serialize_str(name, writer)?;
+            func.serialize(writer)?;
         }
         Ok(())
     }
@@ -768,6 +869,23 @@ impl Compiler {
                     self.add_inst(OpCode::Dup, 0);
                     self.add_inst(OpCode::Jmp, 0);
                 }
+                Statement::FnDef { name, args, stmts } => {
+                    let literals = std::mem::take(&mut self.literals);
+                    let instructions = std::mem::take(&mut self.instructions);
+                    let target_stack = std::mem::take(&mut self.target_stack);
+
+                    self.target_stack = args
+                        .iter()
+                        .map(|arg| Target::Local(arg.to_string()))
+                        .collect();
+
+                    self.compile_stmts(stmts)?;
+
+                    self.add_fn(name.to_string(), args);
+                    self.literals = literals;
+                    self.instructions = instructions;
+                    self.target_stack = target_stack;
+                }
             }
         }
         Ok(last_result)
@@ -794,6 +912,13 @@ impl Compiler {
                 _ => writeln!(writer, " [{i}] {:?}", inst.op)?,
             }
         }
+        Ok(())
+    }
+
+    fn compile(&mut self, stmts: &Statements) -> Result<(), Box<dyn std::error::Error>> {
+        let name = "main";
+        self.compile_stmts(stmts)?;
+        self.add_fn(name.to_string(), &[]);
         Ok(())
     }
 }
@@ -836,32 +961,24 @@ fn print_fn(args: &[Value]) -> Value {
 }
 
 struct ByteCode {
-    literals: Vec<Value>,
-    instructions: Vec<Instruction>,
+    funcs: HashMap<String, FnDef>,
 }
 
 impl ByteCode {
     fn new() -> Self {
         Self {
-            literals: vec![],
-            instructions: vec![],
+            funcs: HashMap::new(),
         }
     }
 
-    fn read_literals(&mut self, reader: &mut impl Read) -> std::io::Result<()> {
-        let num_literals = deserialize_size(reader)?;
-        for _ in 0..num_literals {
-            self.literals.push(Value::deserialize(reader)?);
+    fn read_funcs(&mut self, reader: &mut impl Read) -> std::io::Result<()> {
+        let num_funcs = deserialize_size(reader)?;
+        let mut funcs = HashMap::new();
+        for _ in 0..num_funcs {
+            let name = deserialize_str(reader)?;
+            funcs.insert(name, FnDef::deserialize(reader)?);
         }
-        Ok(())
-    }
-
-    fn read_instructions(&mut self, reader: &mut impl Read) -> std::io::Result<()> {
-        let num_instructions = deserialize_size(reader)?;
-        for _ in 0..num_instructions {
-            let instruction = Instruction::deserialize(reader)?;
-            self.instructions.push(instruction);
-        }
+        self.funcs = funcs;
         Ok(())
     }
 
@@ -871,14 +988,24 @@ impl ByteCode {
         stack.push(Value::F64(op(lhs, rhs)));
     }
 
-    fn interpret(&self) -> Option<Value> {
-        let mut stack = vec![];
+    fn interpret(
+        &self,
+        fn_name: &str,
+        args: &[Value],
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let fn_def = self
+            .funcs
+            .get(fn_name)
+            .ok_or_else(|| format!("Function {fn_name:?} was not found"))?;
+        let mut stack = args.to_vec();
         let mut ip = 0;
 
-        while ip < self.instructions.len() {
-            let instruction = &self.instructions[ip];
+        while ip < fn_def.instructions.len() {
+            let instruction = &fn_def.instructions[ip];
             match instruction.op {
-                OpCode::LoadLiteral => stack.push(self.literals[instruction.arg0 as usize].clone()),
+                OpCode::LoadLiteral => {
+                    stack.push(fn_def.literals[instruction.arg0 as usize].clone())
+                }
                 OpCode::Add => self.interpret_bin_op(&mut stack, |lhs, rhs| lhs + rhs),
                 OpCode::Sub => self.interpret_bin_op(&mut stack, |lhs, rhs| lhs - rhs),
                 OpCode::Mul => self.interpret_bin_op(&mut stack, |lhs, rhs| lhs * rhs),
@@ -906,7 +1033,7 @@ impl ByteCode {
                         "log" => binary_fn(f64::log)(args),
                         "log10" => unary_fn(f64::log10)(args),
                         "print" => print_fn(args),
-                        _ => panic!("Unknown function name {fname:?}"),
+                        _ => self.interpret(fname, args)?,
                     };
                     stack.resize(stack.len() - instruction.arg0 as usize - 1, Value::F64(0.));
                     stack.push(res);
@@ -940,14 +1067,13 @@ impl ByteCode {
             ip += 1;
         }
 
-        stack.pop()
+        Ok(stack.pop().ok_or_else(|| "Stack underflow".to_string())?)
     }
 }
 
 fn read_program(reader: &mut impl Read) -> std::io::Result<ByteCode> {
     let mut bytecode = ByteCode::new();
-    bytecode.read_literals(reader)?;
-    bytecode.read_instructions(reader)?;
+    bytecode.read_funcs(reader)?;
     Ok(bytecode)
 }
 
@@ -961,14 +1087,13 @@ fn write_program(
     let stmts = statements_finish(source)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-    compiler.compile_stmts(&stmts)?;
+    compiler.compile(&stmts)?;
 
     if disasm {
         compiler.disasm(&mut std::io::stdout())?;
     }
 
-    compiler.write_literals(writer).unwrap();
-    compiler.write_instructions(writer).unwrap();
+    compiler.write_funcs(writer)?;
     println!(
         "Written {} literals and {} instructions to {out_file:?}",
         compiler.literals.len(),
@@ -1000,7 +1125,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             let reader = std::fs::File::open("bytecode.bin")?;
             let mut reader = BufReader::new(reader);
             if let Ok(bytecode) = read_program(&mut reader) {
-                let _ = bytecode.interpret();
+                if let Err(e) = bytecode.interpret("main", &[]) {
+                    eprintln!("Runtime error: {e:?}");
+                };
             }
         }
         _ => println!("Please specify -c or -r as an argument"),
