@@ -1,0 +1,9 @@
+fn fact(n: f64) -> f64 {
+  if n < 1 {
+    return 1;
+  } else {
+    return fact(n - 1) * n;
+  };
+}
+
+print(fact(5));
