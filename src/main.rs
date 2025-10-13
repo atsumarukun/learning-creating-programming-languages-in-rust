@@ -3,7 +3,7 @@ use nom::{
     branch::alt,
     bytes::complete::tag,
     character::complete::{alpha1, alphanumeric1, char, multispace0, multispace1, none_of},
-    combinator::{opt, recognize},
+    combinator::{cut, opt, recognize},
     error::ParseError,
     multi::{fold_many0, many0, separated_list0},
     number::complete::recognize_float,
@@ -79,6 +79,7 @@ enum Statement<'src> {
     Return(Expression<'src>),
     Break,
     Continue,
+    Yield(Expression<'src>),
 }
 
 impl<'src> Statement<'src> {
@@ -92,6 +93,7 @@ impl<'src> Statement<'src> {
             FnDef { name, stmts, .. } => calc_offset(*name, stmts.span()),
             Return(ex) => ex.span,
             Break | Continue => return None,
+            Yield(ex) => ex.span,
         })
     }
 }
@@ -506,6 +508,12 @@ fn continue_statement(input: Span) -> IResult<Span, Statement> {
     Ok((input, Statement::Continue))
 }
 
+fn yield_statement(input: Span) -> IResult<Span, Statement> {
+    let (input, _) = space_delimited(tag("yield")).parse(input)?;
+    let (input, ex) = cut(space_delimited(expr)).parse(input)?;
+    Ok((input, Statement::Yield(ex)))
+}
+
 fn statement(input: Span) -> IResult<Span, Statement> {
     alt((
         for_statement,
@@ -517,6 +525,7 @@ fn statement(input: Span) -> IResult<Span, Statement> {
                 return_statement,
                 break_statement,
                 continue_statement,
+                yield_statement,
                 expr_statement,
             )),
             char(';'),
@@ -835,6 +844,9 @@ fn type_check<'src>(
                 //TODO: Check types in break out site.
             }
             Statement::Continue => (),
+            Statement::Yield(e) => {
+                tc_expr(e, ctx)?;
+            }
         }
     }
     Ok(res)
@@ -857,6 +869,7 @@ enum OpCode {
     Pop,
     Dup,
     Ret,
+    Yield,
 }
 
 macro_rules! impl_op_from {
@@ -888,10 +901,11 @@ impl_op_from!(
     Lt,
     Pop,
     Dup,
-    Ret
+    Ret,
+    Yield
 );
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 struct Instruction {
     op: OpCode,
@@ -1510,6 +1524,11 @@ impl Compiler {
                     let res = self.compile_expr(ex)?;
                     self.add_inst(OpCode::Ret, (self.target_stack.len() - res.0 - 1) as u8);
                 }
+                Statement::Yield(ex) => {
+                    let res = self.compile_expr(ex)?;
+                    self.add_inst(OpCode::Yield, (self.target_stack.len() - res.0 - 1) as u8);
+                    self.target_stack.pop();
+                }
             }
         }
         Ok(last_result)
@@ -1596,88 +1615,264 @@ impl ByteCode {
         self.funcs = funcs;
         Ok(())
     }
+}
 
-    fn interpret_bin_op(&self, stack: &mut Vec<Value>, op: impl FnOnce(f64, f64) -> f64) {
-        let rhs = stack.pop().expect("Stack underflow").coerce_f64();
-        let lhs = stack.pop().expect("Stack underflow").coerce_f64();
-        stack.push(Value::F64(op(lhs, rhs)));
+enum YieldResult {
+    Finished(Value),
+    Suspend(Value),
+}
+
+struct StackFrame<'f> {
+    fn_def: &'f FnByteCode,
+    args: usize,
+    stack: Vec<Value>,
+    ip: usize,
+}
+
+impl<'f> StackFrame<'f> {
+    fn new(fn_def: &'f FnByteCode, args: Vec<Value>) -> Self {
+        Self {
+            fn_def,
+            args: args.len(),
+            stack: args,
+            ip: 0,
+        }
     }
 
-    fn interpret(
-        &self,
-        fn_name: &str,
-        args: &[Value],
-    ) -> Result<Value, Box<dyn std::error::Error>> {
+    fn inst(&self) -> Option<Instruction> {
+        let ret = self.fn_def.instructions.get(self.ip)?;
+        Some(*ret)
+    }
+}
+
+struct Vm<'code> {
+    bytecode: &'code ByteCode,
+    stack_frames: Vec<StackFrame<'code>>,
+}
+
+impl<'code> Vm<'code> {
+    fn new(bytecode: &'code ByteCode) -> Self {
+        Self {
+            bytecode,
+            stack_frames: vec![],
+        }
+    }
+
+    fn init_fn(&mut self, fn_name: &str, args: &[Value]) -> Result<(), Box<dyn std::error::Error>> {
         let fn_def = self
+            .bytecode
             .funcs
             .get(fn_name)
             .ok_or_else(|| format!("Function {fn_name:?} was not found"))?;
         let fn_def = match fn_def {
             FnDef::User(user) => user,
-            FnDef::Native(n) => return Ok((*n.code)(args)),
+            FnDef::Native(_) => {
+                return Err("Native function cannot be called as a coroutine.".into());
+            }
         };
-        let mut stack = args.to_vec();
-        let mut ip = 0;
 
-        while ip < fn_def.instructions.len() {
-            let instruction = &fn_def.instructions[ip];
+        self.stack_frames
+            .push(StackFrame::new(fn_def, args.to_vec()));
+        Ok(())
+    }
+
+    fn top(&'_ self) -> Result<&'_ StackFrame<'_>, String> {
+        self.stack_frames
+            .last()
+            .ok_or_else(|| "Stack frame underflow".to_string())
+    }
+
+    fn top_mut(&mut self) -> Result<&mut StackFrame<'code>, String> {
+        self.stack_frames
+            .last_mut()
+            .ok_or_else(|| "Stack frame underflow".to_string())
+    }
+
+    fn return_fn(&mut self, stack_pos: u8) -> Result<Option<YieldResult>, Box<dyn Error>> {
+        let top_frame = self
+            .stack_frames
+            .pop()
+            .ok_or_else(|| "Stack frame underflow at Ret")?;
+        let res = top_frame
+            .stack
+            .get(top_frame.stack.len() - stack_pos as usize - 1)
+            .ok_or_else(|| "Stack underflow at Ret")?
+            .clone();
+        let args = top_frame.args;
+
+        if self.stack_frames.is_empty() {
+            return Ok(Some(YieldResult::Finished(res)));
+        }
+
+        let stack = &mut self.top_mut()?.stack;
+        stack.resize(stack.len() - args - 1, Value::F64(0.));
+        stack.push(res);
+        self.top_mut()?.ip += 1;
+        Ok(None)
+    }
+
+    fn interpret_bin_op_str(
+        stack: &mut Vec<Value>,
+        op_f64: impl FnOnce(f64, f64) -> f64,
+        op_i64: impl FnOnce(i64, i64) -> i64,
+        op_str: impl FnOnce(&str, &str) -> Option<String>,
+    ) {
+        use Value::*;
+        let rhs = stack.pop().expect("Stack underflow");
+        let lhs = stack.pop().expect("Stack underflow");
+        let res = match (lhs, rhs) {
+            (F64(lhs), F64(rhs)) => F64(op_f64(lhs, rhs)),
+            (I64(lhs), I64(rhs)) => I64(op_i64(lhs, rhs)),
+            (F64(lhs), I64(rhs)) => F64(op_f64(lhs, rhs as f64)),
+            (I64(lhs), F64(rhs)) => F64(op_f64(lhs as f64, rhs)),
+            (Str(lhs), Str(rhs)) => {
+                if let Some(res) = op_str(&lhs, &rhs) {
+                    Str(res)
+                } else {
+                    panic!("Incompatible types in binary op: {lhs:?} and {rhs:?}");
+                }
+            }
+            (lhs, rhs) => panic!("Incompatible types in binary op: {lhs:?} and {rhs:?}"),
+        };
+        stack.push(res);
+    }
+
+    fn interpret_bin_op(
+        stack: &mut Vec<Value>,
+        op_f64: impl FnOnce(f64, f64) -> f64,
+        op_i64: impl FnOnce(i64, i64) -> i64,
+    ) {
+        Self::interpret_bin_op_str(stack, op_f64, op_i64, |_, _| None)
+    }
+
+    fn interpret(&mut self) -> Result<YieldResult, Box<dyn std::error::Error>> {
+        loop {
+            let instruction = if let Some(instruction) = self.top()?.inst() {
+                instruction
+            } else {
+                if let Some(res) = self.return_fn(0)? {
+                    return Ok(res);
+                }
+                continue;
+            };
+
             match instruction.op {
                 OpCode::LoadLiteral => {
-                    stack.push(fn_def.literals[instruction.arg0 as usize].clone())
+                    let stack_frame = self.top_mut()?;
+                    stack_frame
+                        .stack
+                        .push(stack_frame.fn_def.literals[instruction.arg0 as usize].clone())
                 }
-                OpCode::Add => self.interpret_bin_op(&mut stack, |lhs, rhs| lhs + rhs),
-                OpCode::Sub => self.interpret_bin_op(&mut stack, |lhs, rhs| lhs - rhs),
-                OpCode::Mul => self.interpret_bin_op(&mut stack, |lhs, rhs| lhs * rhs),
-                OpCode::Div => self.interpret_bin_op(&mut stack, |lhs, rhs| lhs / rhs),
+                OpCode::Add => Self::interpret_bin_op_str(
+                    &mut self.top_mut()?.stack,
+                    |lhs, rhs| lhs + rhs,
+                    |lhs, rhs| lhs + rhs,
+                    |lhs, rhs| Some(format!("{lhs}{rhs}")),
+                ),
+                OpCode::Sub => Self::interpret_bin_op(
+                    &mut self.top_mut()?.stack,
+                    |lhs, rhs| lhs - rhs,
+                    |lhs, rhs| lhs - rhs,
+                ),
+                OpCode::Mul => Self::interpret_bin_op(
+                    &mut self.top_mut()?.stack,
+                    |lhs, rhs| lhs * rhs,
+                    |lhs, rhs| lhs * rhs,
+                ),
+                OpCode::Div => Self::interpret_bin_op(
+                    &mut self.top_mut()?.stack,
+                    |lhs, rhs| lhs / rhs,
+                    |lhs, rhs| lhs / rhs,
+                ),
                 OpCode::Copy => {
+                    let stack = &mut self.top_mut()?.stack;
                     stack.push(stack[stack.len() - instruction.arg0 as usize - 1].clone())
                 }
                 OpCode::Call => {
+                    let stack = &self.top()?.stack;
                     let args = &stack[stack.len() - instruction.arg0 as usize..];
                     let fname = &stack[stack.len() - instruction.arg0 as usize - 1];
                     let Value::Str(fname) = fname else {
                         panic!("Function name shall be a string: {fname:?}")
                     };
-                    let res = self.interpret(fname, args)?;
-                    stack.resize(stack.len() - instruction.arg0 as usize - 1, Value::F64(0.));
-                    stack.push(res);
+                    let fn_def = self
+                        .bytecode
+                        .funcs
+                        .get(fname)
+                        .ok_or_else(|| format!("Function name shall be a string {fname:?}"))?;
+                    match fn_def {
+                        FnDef::User(user) => {
+                            self.stack_frames
+                                .push(StackFrame::new(user.clone(), args.to_vec()));
+                            continue;
+                        }
+                        FnDef::Native(native) => {
+                            let res = (native.code)(args);
+                            let stack = &mut self.top_mut()?.stack;
+                            stack.resize(
+                                stack.len() - instruction.arg0 as usize - 1,
+                                Value::F64(0.),
+                            );
+                            stack.push(res);
+                        }
+                    }
                 }
                 OpCode::Store => {
+                    let stack = &mut self.top_mut()?.stack;
                     let idx = stack.len() - instruction.arg0 as usize - 1;
                     stack[idx] = stack.pop().expect("Store needs an argument");
                 }
                 OpCode::Jmp => {
-                    ip = instruction.arg0 as usize;
+                    self.top_mut()?.ip = instruction.arg0 as usize;
                     continue;
                 }
                 OpCode::Jf => {
+                    let stack = &mut self.top_mut()?.stack;
                     let cond = stack.pop().expect("If needs an argument");
                     if cond.coerce_f64() == 0. {
-                        ip = instruction.arg0 as usize;
+                        self.top_mut()?.ip = instruction.arg0 as usize;
                         continue;
                     }
                 }
-                OpCode::Lt => {
-                    self.interpret_bin_op(&mut stack, |lhs, rhs| (lhs < rhs) as i32 as f64)
-                }
+                OpCode::Lt => Self::interpret_bin_op(
+                    &mut self.top_mut()?.stack,
+                    |lhs, rhs| (lhs < rhs) as i32 as f64,
+                    |lhs, rhs| (lhs < rhs) as i64,
+                ),
                 OpCode::Pop => {
-                    stack.resize(stack.len() - instruction.arg0 as usize, Value::default())
+                    let stack = &mut self.top_mut()?.stack;
+                    stack.resize(stack.len() - instruction.arg0 as usize, Value::default());
                 }
                 OpCode::Dup => {
+                    let stack = &mut self.top_mut()?.stack;
                     let top = stack.last().unwrap().clone();
                     stack.extend((0..instruction.arg0).map(|_| top.clone()));
                 }
                 OpCode::Ret => {
-                    return Ok(stack
-                        .get(stack.len() - instruction.arg0 as usize - 1)
-                        .ok_or_else(|| "Stack underflow".to_string())?
-                        .clone());
+                    if let Some(res) = self.return_fn(instruction.arg0)? {
+                        return Ok(res);
+                    }
+                    continue;
+                }
+                OpCode::Yield => {
+                    let top_frame = self.top_mut()?;
+                    let res = top_frame
+                        .stack
+                        .pop()
+                        .ok_or_else(|| "Stack underflor".to_string())?;
+                    top_frame.ip += 1;
+                    return Ok(YieldResult::Suspend(res));
                 }
             }
-            ip += 1;
-        }
 
-        Ok(stack.pop().ok_or_else(|| "Stack underflow".to_string())?)
+            self.top_mut()?.ip += 1;
+        }
+    }
+
+    fn back_trace(&self) {
+        for (i, frame) in self.stack_frames.iter().rev().enumerate() {
+            println!("[{}]: {:?}", i, frame.stack);
+        }
     }
 }
 
@@ -1732,9 +1927,54 @@ fn write_program(
     Ok(())
 }
 
+fn debugger(vm: &Vm) -> bool {
+    println!("[c]ontinue/[p]rint/[e]xit/[bt]race?");
+    loop {
+        let mut buffer = String::new();
+        if std::io::stdin().read_line(&mut buffer).is_ok() {
+            match buffer.trim() {
+                "c" => return false,
+                "p" => {
+                    println!("Stack: {:?}", vm.top().unwrap().stack);
+                }
+                "e" => return true,
+                "bt" => vm.back_trace(),
+                _ => println!("Please say [c]ontinue/[p]rint/[b]reak"),
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args();
     args.next();
+
+    let run_coro = |mut vm: Vm| {
+        if let Err(e) = vm.init_fn("main", &[]) {
+            eprintln!("init_fn error: {e:?}");
+        }
+        loop {
+            match vm.interpret() {
+                Ok(YieldResult::Finished(_)) => break,
+                Ok(YieldResult::Suspend(value)) => {
+                    println!(
+                        "Execution suspended with a yielded value {value}.
+                    I'll continue..."
+                    );
+                    if value == Value::Str("break".to_string()) {
+                        if debugger(&vm) {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Runtime error: {e:?}");
+                    break;
+                }
+            }
+        }
+    };
+
     match args.next().as_ref().map(|s| s as &str) {
         Some("-c") => {
             let mut disasm = false;
@@ -1756,9 +1996,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let reader = std::fs::File::open("bytecode.bin")?;
             let mut reader = BufReader::new(reader);
             if let Ok(bytecode) = read_program(&mut reader) {
-                if let Err(e) = bytecode.interpret("main", &[]) {
-                    eprintln!("Runtime error: {e:?}");
-                };
+                run_coro(Vm::new(&bytecode))
             }
         }
         _ => println!("Please specify -c or -r as an argument"),
