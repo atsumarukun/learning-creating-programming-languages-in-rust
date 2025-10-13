@@ -11,10 +11,12 @@ use nom::{
 };
 use nom_locate::LocatedSpan;
 use std::{
+    cell::RefCell,
     collections::HashMap,
     error::Error,
     fmt::Display,
     io::{BufReader, BufWriter, Read, Write},
+    rc::Rc,
     usize,
 };
 
@@ -35,6 +37,7 @@ enum ExprEnum<'src> {
         Box<Statements<'src>>,
         Option<Box<Statements<'src>>>,
     ),
+    Await(Box<Expression<'src>>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -75,6 +78,7 @@ enum Statement<'src> {
         args: Vec<(Span<'src>, TypeDecl)>,
         ret_type: TypeDecl,
         stmts: Statements<'src>,
+        cofn: bool,
     },
     Return(Expression<'src>),
     Break,
@@ -113,6 +117,7 @@ impl<'a> GetSpan<'a> for Statements<'a> {
 struct UserFn<'src> {
     args: Vec<(Span<'src>, TypeDecl)>,
     ret_type: TypeDecl,
+    cofn: bool,
 }
 
 struct NativeFn<'src> {
@@ -136,7 +141,13 @@ impl<'src> FnDecl<'src> {
 
     fn ret_type(&self) -> TypeDecl {
         match self {
-            Self::User(user) => user.ret_type,
+            Self::User(user) => {
+                if user.cofn {
+                    TypeDecl::Coro
+                } else {
+                    user.ret_type
+                }
+            }
             Self::Native(native) => native.ret_type,
         }
     }
@@ -388,8 +399,18 @@ fn if_expr(input: Span) -> IResult<Span, Expression> {
     ))
 }
 
+fn await_expr(input: Span) -> IResult<Span, Expression> {
+    let span = input;
+    let (input, _) = space_delimited(tag("await")).parse(input)?;
+    let (input, ex) = cut(space_delimited(expr)).parse(input)?;
+    Ok((
+        input,
+        Expression::new(ExprEnum::Await(Box::new(ex)), calc_offset(span, input)),
+    ))
+}
+
 fn expr(input: Span) -> IResult<Span, Expression> {
-    alt((if_expr, cond_expr, num_expr)).parse(input)
+    alt((await_expr, if_expr, cond_expr, num_expr)).parse(input)
 }
 
 fn type_decl(input: Span) -> IResult<Span, TypeDecl> {
@@ -400,6 +421,7 @@ fn type_decl(input: Span) -> IResult<Span, TypeDecl> {
             "f64" => TypeDecl::F64,
             "i64" => TypeDecl::I64,
             "str" => TypeDecl::Str,
+            "cofn" => TypeDecl::Coro,
             _ => panic!("Type annotation has unknown type: {td}"),
         },
     ))
@@ -473,7 +495,7 @@ fn argument(input: Span) -> IResult<Span, (Span, TypeDecl)> {
 }
 
 fn fn_def_statement(input: Span) -> IResult<Span, Statement> {
-    let (input, _) = space_delimited(tag("fn")).parse(input)?;
+    let (input, fn_kw) = space_delimited(alt((tag("cofn"), tag("fn")))).parse(input)?;
     let (input, name) = space_delimited(identifier).parse(input)?;
     let (input, _) = space_delimited(tag("(")).parse(input)?;
     let (input, args) = separated_list0(char(','), space_delimited(argument)).parse(input)?;
@@ -488,6 +510,7 @@ fn fn_def_statement(input: Span) -> IResult<Span, Statement> {
             args,
             ret_type,
             stmts,
+            cofn: *fn_kw == "cofn",
         },
     ))
 }
@@ -581,11 +604,12 @@ fn binary_fn<'a>(f: fn(f64, f64) -> f64) -> FnDecl<'a> {
 type Span<'a> = LocatedSpan<&'a str>;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub enum TypeDecl {
+enum TypeDecl {
     Any,
     F64,
     I64,
     Str,
+    Coro,
 }
 
 struct TypeCheckContext<'src, 'ctx> {
@@ -667,6 +691,7 @@ fn tc_coerce_type<'src>(
         (F64, I64) => F64,
         (I64, I64) => I64,
         (Str, Str) => Str,
+        (Coro, Coro) => Coro,
         _ => {
             return Err(TypeCheckError::new(
                 format!(
@@ -782,6 +807,10 @@ fn tc_expr<'src>(
                 true_type
             }
         }
+        Await(ex) => {
+            let _res = tc_expr(ex, ctx)?;
+            TypeDecl::Any
+        }
     })
 }
 
@@ -807,12 +836,14 @@ fn type_check<'src>(
                 args,
                 ret_type,
                 stmts,
+                cofn,
             } => {
                 ctx.funcs.insert(
                     name.to_string(),
                     FnDecl::User(UserFn {
                         args: args.clone(),
                         ret_type: *ret_type,
+                        cofn: *cofn,
                     }),
                 );
                 let mut subctx = TypeCheckContext::push_stack(ctx);
@@ -870,6 +901,7 @@ enum OpCode {
     Dup,
     Ret,
     Yield,
+    Await,
 }
 
 macro_rules! impl_op_from {
@@ -902,7 +934,8 @@ impl_op_from!(
     Pop,
     Dup,
     Ret,
-    Yield
+    Yield,
+    Await
 );
 
 #[derive(Debug, Clone, Copy)]
@@ -951,18 +984,32 @@ enum ValueKind {
     F64,
     I64,
     Str,
+    Coro,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 enum Value {
     F64(f64),
     I64(i64),
     Str(String),
+    Coro(Rc<RefCell<Vm>>),
 }
 
 impl Default for Value {
     fn default() -> Self {
         Self::F64(0.)
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        use Value::*;
+        match (self, other) {
+            (F64(lhs), F64(rhs)) => lhs == rhs,
+            (I64(lhs), I64(rhs)) => lhs == rhs,
+            (Str(lhs), Str(rhs)) => lhs == rhs,
+            _ => false,
+        }
     }
 }
 
@@ -972,6 +1019,7 @@ impl Display for Value {
             Self::F64(v) => write!(f, "{v}"),
             Self::I64(v) => write!(f, "{v}"),
             Self::Str(v) => write!(f, "{v}"),
+            Self::Coro(_) => write!(f, "<Coroutine>"),
         }
     }
 }
@@ -982,6 +1030,7 @@ impl Value {
             Self::F64(_) => ValueKind::F64,
             Self::I64(_) => ValueKind::I64,
             Self::Str(_) => ValueKind::Str,
+            Self::Coro(_) => ValueKind::Coro,
         }
     }
 
@@ -997,6 +1046,12 @@ impl Value {
             }
             Self::Str(value) => {
                 serialize_str(value, writer)?;
+            }
+            Self::Coro(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Coroutine can't be serialized",
+                ));
             }
         }
         Ok(())
@@ -1053,6 +1108,7 @@ impl Value {
             Self::F64(value) => format!("{value}"),
             Self::I64(value) => format!("{value}"),
             Self::Str(value) => value.clone(),
+            _ => panic!("Coercion failed: {:?} cannot be coerced to str", self),
         }
     }
 }
@@ -1104,6 +1160,7 @@ struct FnByteCode {
     args: Vec<String>,
     literals: Vec<Value>,
     instructions: Vec<Instruction>,
+    cofn: bool,
 }
 
 impl FnByteCode {
@@ -1135,6 +1192,7 @@ impl FnByteCode {
         Self::write_args(&self.args, writer)?;
         Self::write_literals(&self.literals, writer)?;
         Self::write_insts(&*self.instructions, writer)?;
+        writer.write_all(&[self.cofn as u8])?;
         Ok(())
     }
 
@@ -1170,12 +1228,47 @@ impl FnByteCode {
         let args = Self::read_args(reader)?;
         let literals = Self::read_literals(reader)?;
         let instructions = Self::read_instructions(reader)?;
+        let mut cofn = [0u8];
+        reader.read_exact(&mut cofn)?;
         Ok(Self {
             args,
             literals,
             instructions,
+            cofn: cofn[0] != 0,
         })
     }
+
+    fn disasm(&self, writer: &mut impl Write) -> std::io::Result<()> {
+        disasm_common(&self.literals, &self.instructions, writer)
+    }
+}
+
+fn disasm_common(
+    literals: &[Value],
+    instructions: &[Instruction],
+    writer: &mut impl Write,
+) -> std::io::Result<()> {
+    use OpCode::*;
+    writeln!(writer, "  Literals [{}]", literals.len())?;
+    for (i, con) in literals.iter().enumerate() {
+        writeln!(writer, "    [{i}] {}", *con)?;
+    }
+
+    writeln!(writer, "  Instructions [{}]", instructions.len())?;
+    for (i, inst) in instructions.iter().enumerate() {
+        match inst.op {
+            LoadLiteral => writeln!(
+                writer,
+                "    [{i}] {:?} {} ({:?})",
+                inst.op, inst.arg0, literals[inst.arg0 as usize]
+            )?,
+            Copy | Dup | Call | Jmp | Jf | Pop | Store | Ret => {
+                writeln!(writer, "    [{i}] {:?} {}", inst.op, inst.arg0)?
+            }
+            _ => writeln!(writer, "    [{i}] {:?}", inst.op)?,
+        }
+    }
+    Ok(())
 }
 
 struct Compiler {
@@ -1259,13 +1352,14 @@ impl Compiler {
         inst
     }
 
-    fn add_fn(&mut self, name: String, args: &[(Span, TypeDecl)]) {
+    fn add_fn(&mut self, name: String, args: &[(Span, TypeDecl)], cofn: bool) {
         self.funcs.insert(
             name,
             FnByteCode {
                 args: args.iter().map(|(arg, _)| arg.to_string()).collect(),
                 literals: std::mem::take(&mut self.literals),
                 instructions: std::mem::take(&mut self.instructions),
+                cofn,
             },
         );
     }
@@ -1382,6 +1476,12 @@ impl Compiler {
                 }
                 self.coerce_stack(StkIdx(stack_size_before + 1));
                 self.fixup_jmp(jmp_inst);
+                self.stack_top()
+            }
+            ExprEnum::Await(ex) => {
+                let res = self.compile_expr(ex)?;
+                self.add_copy_inst(res);
+                self.add_inst(OpCode::Await, 0);
                 self.stack_top()
             }
         })
@@ -1502,7 +1602,11 @@ impl Compiler {
                     self.add_inst(OpCode::Jmp, 0);
                 }
                 Statement::FnDef {
-                    name, args, stmts, ..
+                    name,
+                    args,
+                    stmts,
+                    cofn,
+                    ..
                 } => {
                     let literals = std::mem::take(&mut self.literals);
                     let instructions = std::mem::take(&mut self.instructions);
@@ -1515,7 +1619,7 @@ impl Compiler {
 
                     self.compile_stmts(stmts)?;
 
-                    self.add_fn(name.to_string(), args);
+                    self.add_fn(name.to_string(), args, *cofn);
                     self.literals = literals;
                     self.instructions = instructions;
                     self.target_stack = target_stack;
@@ -1535,25 +1639,13 @@ impl Compiler {
     }
 
     fn disasm(&self, writer: &mut impl Write) -> std::io::Result<()> {
-        use OpCode::*;
-        writeln!(writer, "Literals [{}]", self.literals.len())?;
-        for (i, con) in self.literals.iter().enumerate() {
-            writeln!(writer, " [{i}] {}", *con)?;
-        }
-
-        writeln!(writer, "Instructions [{}]", self.instructions.len())?;
-        for (i, inst) in self.instructions.iter().enumerate() {
-            match inst.op {
-                LoadLiteral => writeln!(
-                    writer,
-                    " [{i}] {:?} {} ({:?})",
-                    inst.op, inst.arg0, self.literals[inst.arg0 as usize]
-                )?,
-                Copy | Call | Jmp | Jf | Pop | Store | Dup => {
-                    writeln!(writer, " [{i}] {:?} {}", inst.op, inst.arg0)?
-                }
-                _ => writeln!(writer, " [{i}] {:?}", inst.op)?,
+        for (name, fn_def) in &self.funcs {
+            if fn_def.cofn {
+                writeln!(writer, "Coroutine {name:?}:")?;
+            } else {
+                writeln!(writer, "Function {name:?}:")?;
             }
+            fn_def.disasm(writer)?;
         }
         Ok(())
     }
@@ -1561,7 +1653,7 @@ impl Compiler {
     fn compile(&mut self, stmts: &Statements) -> Result<(), Box<dyn std::error::Error>> {
         let name = "main";
         self.compile_stmts_or_zero(stmts)?;
-        self.add_fn(name.to_string(), &[]);
+        self.add_fn(name.to_string(), &[], false);
         Ok(())
     }
 }
@@ -1581,7 +1673,7 @@ fn print_fn(args: &[Value]) -> Value {
 }
 
 enum FnDef {
-    User(FnByteCode),
+    User(Rc<FnByteCode>),
     Native(NativeFn<'static>),
 }
 
@@ -1610,7 +1702,7 @@ impl ByteCode {
             .collect();
         for _ in 0..num_funcs {
             let name = deserialize_str(reader)?;
-            funcs.insert(name, FnDef::User(FnByteCode::deserialize(reader)?));
+            funcs.insert(name, FnDef::User(Rc::new(FnByteCode::deserialize(reader)?)));
         }
         self.funcs = funcs;
         Ok(())
@@ -1622,15 +1714,15 @@ enum YieldResult {
     Suspend(Value),
 }
 
-struct StackFrame<'f> {
-    fn_def: &'f FnByteCode,
+struct StackFrame {
+    fn_def: Rc<FnByteCode>,
     args: usize,
     stack: Vec<Value>,
     ip: usize,
 }
 
-impl<'f> StackFrame<'f> {
-    fn new(fn_def: &'f FnByteCode, args: Vec<Value>) -> Self {
+impl StackFrame {
+    fn new(fn_def: Rc<FnByteCode>, args: Vec<Value>) -> Self {
         Self {
             fn_def,
             args: args.len(),
@@ -1645,13 +1737,19 @@ impl<'f> StackFrame<'f> {
     }
 }
 
-struct Vm<'code> {
-    bytecode: &'code ByteCode,
-    stack_frames: Vec<StackFrame<'code>>,
+struct Vm {
+    bytecode: Rc<ByteCode>,
+    stack_frames: Vec<StackFrame>,
 }
 
-impl<'code> Vm<'code> {
-    fn new(bytecode: &'code ByteCode) -> Self {
+impl std::fmt::Debug for Vm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<Vm>")
+    }
+}
+
+impl Vm {
+    fn new(bytecode: Rc<ByteCode>) -> Self {
         Self {
             bytecode,
             stack_frames: vec![],
@@ -1665,7 +1763,7 @@ impl<'code> Vm<'code> {
             .get(fn_name)
             .ok_or_else(|| format!("Function {fn_name:?} was not found"))?;
         let fn_def = match fn_def {
-            FnDef::User(user) => user,
+            FnDef::User(user) => user.clone(),
             FnDef::Native(_) => {
                 return Err("Native function cannot be called as a coroutine.".into());
             }
@@ -1676,13 +1774,13 @@ impl<'code> Vm<'code> {
         Ok(())
     }
 
-    fn top(&'_ self) -> Result<&'_ StackFrame<'_>, String> {
+    fn top(&self) -> Result<&StackFrame, String> {
         self.stack_frames
             .last()
             .ok_or_else(|| "Stack frame underflow".to_string())
     }
 
-    fn top_mut(&mut self) -> Result<&mut StackFrame<'code>, String> {
+    fn top_mut(&mut self) -> Result<&mut StackFrame, String> {
         self.stack_frames
             .last_mut()
             .ok_or_else(|| "Stack frame underflow".to_string())
@@ -1802,9 +1900,21 @@ impl<'code> Vm<'code> {
                         .ok_or_else(|| format!("Function name shall be a string {fname:?}"))?;
                     match fn_def {
                         FnDef::User(user) => {
-                            self.stack_frames
-                                .push(StackFrame::new(user.clone(), args.to_vec()));
-                            continue;
+                            if user.cofn {
+                                let mut vm = Vm::new(self.bytecode.clone());
+                                vm.stack_frames
+                                    .push(StackFrame::new(user.clone(), args.to_vec()));
+                                let stack = &mut self.top_mut()?.stack;
+                                stack.resize(
+                                    stack.len() - instruction.arg0 as usize - 1,
+                                    Value::F64(0.),
+                                );
+                                stack.push(Value::Coro(Rc::new(RefCell::new(vm))));
+                            } else {
+                                self.stack_frames
+                                    .push(StackFrame::new(user.clone(), args.to_vec()));
+                                continue;
+                            }
                         }
                         FnDef::Native(native) => {
                             let res = (native.code)(args);
@@ -1862,6 +1972,23 @@ impl<'code> Vm<'code> {
                         .ok_or_else(|| "Stack underflor".to_string())?;
                     top_frame.ip += 1;
                     return Ok(YieldResult::Suspend(res));
+                }
+                OpCode::Await => {
+                    let vms = self
+                        .top_mut()?
+                        .stack
+                        .pop()
+                        .ok_or_else(|| "Stack underflow".to_string())?;
+                    let Value::Coro(vm) = vms else {
+                        return Err("Await keyword applied to a non-coroutine".into());
+                    };
+                    match vm.borrow_mut().interpret() {
+                        Ok(YieldResult::Finished(_)) => (),
+                        Ok(YieldResult::Suspend(value)) => {
+                            self.top_mut()?.stack.push(value);
+                        }
+                        Err(e) => eprintln!("Runtime error: {e:?}"),
+                    };
                 }
             }
 
@@ -1996,7 +2123,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let reader = std::fs::File::open("bytecode.bin")?;
             let mut reader = BufReader::new(reader);
             if let Ok(bytecode) = read_program(&mut reader) {
-                run_coro(Vm::new(&bytecode))
+                run_coro(Vm::new(Rc::new(bytecode)))
             }
         }
         _ => println!("Please specify -c or -r as an argument"),
